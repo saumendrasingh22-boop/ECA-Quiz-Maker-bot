@@ -1,1267 +1,2122 @@
-""" ECA Quiz Bot - standalone production-oriented Telegram quiz bot. Interface language: English only. Quiz content language: Hindi / English / Bilingual. AI: Google Gemini API via google-genai. PDF: ReportLab with Devanagari font support when available. Storage: SQLite (no external database required). Required environment variables: BOT_TOKEN=Telegram bot token GEMINI_API_KEY=Google Gemini API key ADMIN_IDS=comma-separated Telegram numeric user IDs QUIZ_CHAT_ID=optional Telegram chat/channel ID for publishing prepared quiz links ECA_TELEGRAM_URL=https://t.me/EternalCivilAcademy Optional: DEFAULT_QUESTION_TIME=30 MAX_QUESTIONS=100 GEMINI_MODELS=gemini-3.6-flash,gemini-3.6-flash,gemini-3.5-flash-lite PDF_DIR=data/pdfs DB_PATH=data/quiz.db Install: pip install -r requirements.txt Run: python bot.py """
+# -*- coding: utf-8 -*-
+"""
+ECA QUIZ MAKER â€” Production Telegram Quiz Bot
+
+Designed for Render + Telegram + Google Gemini.
+
+Core flow
+---------
+1) ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡
+2) ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾
+
+AI mode: Topic -> Count -> Language -> Gemini searches/grounds sources ->
+original MCQs -> strict validation -> prepared quiz.
+
+Source mode: PDF / Photo / Text / Telegram Poll / URL -> Topic -> Count ->
+Language -> original MCQs based on supplied material.
+
+Prepared quiz is NEVER dumped as a batch of Telegram polls.
+Admin chooses Personal or Group, then chooses per-question time:
+15 sec / 25 sec / 30 sec / 1 min.
+Exactly one native Telegram quiz poll is published at a time.
+
+Important quota behavior
+------------------------
+A 429 RESOURCE_EXHAUSTED error is a provider quota problem. Changing models
+inside the same Google project does NOT magically create quota. This bot:
+- avoids repeated hammering of the same key/model;
+- supports multiple GEMINI_API_KEYS (comma-separated);
+- uses a single bounded retry for transient failures;
+- records/returns partial valid output rather than fabricating questions;
+- never bypasses validation just to reach the requested count.
+
+For actual multi-key quota failover, keys should belong to separately usable
+projects/quotas. Never paste keys into Telegram/GitHub.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import io
+import hashlib
 import json
 import logging
-import math
 import os
 import re
-import sqlite3
 import tempfile
+import threading
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    Update,
-)
-from telegram.constants import ParseMode
+import requests
+from bs4 import BeautifulSoup
+from google import genai
+from google.genai import types
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from telegram import Poll, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     PollAnswerHandler,
     filters,
 )
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except Exception:
-    genai = None
-    genai_types = None
 
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
-
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import (
-    HRFlowable,
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
-
-# ---------------------------------------------------------------------------
+# ============================================================
 # Configuration
-# ---------------------------------------------------------------------------
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-PDF_DIR = Path(os.getenv("PDF_DIR", str(DATA_DIR / "pdfs")))
-DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "quiz.db")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-PDF_DIR.mkdir(parents=True, exist_ok=True)
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-ECA_TELEGRAM_URL = os.getenv(
-    "ECA_TELEGRAM_URL", "https://t.me/EternalCivilAcademy"
-).strip()
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0") or "0")
 
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+# Primary Gemini key + optional comma-separated additional keys.
+# Example (Render Environment Variables):
+# GEMINI_API_KEY=key1
+# GEMINI_API_KEYS=key1,key2,key3
+raw_keys = os.getenv("GEMINI_API_KEYS", "").strip()
+GEMINI_API_KEYS: list[str] = []
+if raw_keys:
+    GEMINI_API_KEYS.extend([x.strip() for x in raw_keys.split(",") if x.strip()])
+if os.getenv("GEMINI_API_KEY", "").strip():
+    GEMINI_API_KEYS.insert(0, os.getenv("GEMINI_API_KEY", "").strip())
+# Remove duplicates while preserving order.
+GEMINI_API_KEYS = list(dict.fromkeys(GEMINI_API_KEYS))
 
-DEFAULT_QUESTION_TIME = max(5, int(os.getenv("DEFAULT_QUESTION_TIME", "30")))
-MAX_QUESTIONS = min(100, max(1, int(os.getenv("MAX_QUESTIONS", "100"))))
-
-# Current stable Flash model first; fallbacks are only attempted when needed.
-GEMINI_MODELS = [
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+FALLBACK_MODELS = [
     x.strip()
     for x in os.getenv(
-        "GEMINI_MODELS",
-        "gemini-3.6-flash,gemini-3.6-flash,gemini-3.5-flash-lite",
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.1-flash-lite,gemini-3.5-flash",
     ).split(",")
     if x.strip()
 ]
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///eca_quiz_v3.db").strip()
+PORT = int(os.getenv("PORT", "10000") or "10000")
+
+MAX_QUESTIONS = 100
+MAX_SOURCE_TEXT = 120_000
+MAX_HISTORY_FOR_PROMPT = 250
+MAX_HISTORY_FOR_SIMILARITY = 1200
+AI_MAX_CALLS_PER_REQUEST = 8
+AI_TRANSIENT_RETRY_COUNT = 1
+AI_RETRY_DELAY = 2.0
+SOURCE_FOOTER = "Source: @EternalCivilAcademy"
+
+LANGUAGE_LABELS = {
+    "Hindi": "Hindi",
+    "English": "English",
+    "Bilingual": "Bilingual",
+}
+LANGUAGE_BUTTONS = [["Hindi", "English"], ["Bilingual"]]
+
+TIME_OPTIONS = {
+    "15 seconds": 15,
+    "25 seconds": 25,
+    "30 seconds": 30,
+    "1 minute": 60,
+}
+TIME_BUTTONS = [["15 seconds", "25 seconds"], ["30 seconds", "1 minute"]]
+
+MAIN_BUTTONS = [
+    ["ðŸ¤– AI Generate Questions"],
+    ["ðŸ“š I Will Provide Source"],
+]
+
+SOURCE_TYPE_BUTTONS = [
+    ["ðŸ“„ PDF", "ðŸ–¼ Photo"],
+    ["ðŸ“ Text", "ðŸ“Š Telegram Poll"],
+    ["ðŸ”— URL"],
+]
+
+
+# ============================================================
+# Logging / validation
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("eca_quiz_bot")
+logger = logging.getLogger("eca_quiz_bot")
 
-# ---------------------------------------------------------------------------
-# SQLite
-# ---------------------------------------------------------------------------
-
-DB_LOCK = asyncio.Lock()
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+if OWNER_USER_ID == 0:
+    raise RuntimeError("OWNER_USER_ID environment variable is missing.")
+if not GEMINI_API_KEYS:
+    raise RuntimeError("GEMINI_API_KEY or GEMINI_API_KEYS environment variable is missing.")
 
 
-def init_db():
-    conn = db()
-    conn.executescript(
-        """ CREATE TABLE IF NOT EXISTS quizzes ( id TEXT PRIMARY KEY, title TEXT NOT NULL, source_name TEXT, source_text TEXT, language TEXT NOT NULL, question_time INTEGER NOT NULL, questions_json TEXT NOT NULL, created_at TEXT NOT NULL, quiz_date TEXT NOT NULL, quiz_time TEXT NOT NULL ); CREATE TABLE IF NOT EXISTS attempts ( quiz_id TEXT NOT NULL, user_id INTEGER NOT NULL, username TEXT, display_name TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, current_index INTEGER NOT NULL DEFAULT 0, started_at TEXT, completed_at TEXT, PRIMARY KEY (quiz_id, user_id) ); CREATE TABLE IF NOT EXISTS answers ( quiz_id TEXT NOT NULL, user_id INTEGER NOT NULL, q_index INTEGER NOT NULL, selected INTEGER, correct INTEGER NOT NULL DEFAULT 0, answered_at TEXT NOT NULL, PRIMARY KEY (quiz_id, user_id, q_index) ); CREATE INDEX IF NOT EXISTS idx_answers_quiz_user ON answers(quiz_id, user_id); CREATE TABLE IF NOT EXISTS poll_map ( poll_id TEXT PRIMARY KEY, quiz_id TEXT NOT NULL, q_index INTEGER NOT NULL ); """
-    )
-    conn.commit()
-    conn.close()
+# ============================================================
+# Database
+# ============================================================
+
+class Base(DeclarativeBase):
+    pass
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+class Admin(Base):
+    __tablename__ = "eca_v3_admins"
 
-def now_local() -> datetime:
-    # Render normally runs UTC. Telegram timestamps in the PDF are labelled UTC
-    # only if TZ is unavailable; we prefer the process local timezone.
-    return datetime.now().astimezone()
-
-
-def safe_text(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def clean_ui_text(text: str) -> str:
-    """UI text is English-only and intentionally ASCII-safe."""
-    text = safe_text(text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^\x20-\x7E\n\r\t]", "", text)
-    return text.strip()
-
-
-def normalize_language(value: str) -> str:
-    v = safe_text(value).lower()
-    if "bilingual" in v:
-        return "Bilingual"
-    if "english" in v:
-        return "English"
-    return "Hindi"
-
-
-def user_display_name(user) -> str:
-    name = " ".join(
-        x for x in [getattr(user, "first_name", ""), getattr(user, "last_name", "")]
-        if x
-    ).strip()
-    return name or getattr(user, "username", None) or f"User {user.id}"
-
-
-def user_label(user_id: int, username: Optional[str], display_name: str) -> str:
-    # User asked for user ID in brackets if available. Telegram numeric ID is
-    # always available; username is included when present.
-    if username:
-        return f"{display_name} (@{username})"
-    return f"{display_name} [{user_id}]"
-
-
-def raw_marks(right: int, wrong: int, total: int) -> float:
-    return round(right - (wrong / 3.0), 2)
-
-
-def rank_from_rows(rows: list[dict], position: int) -> int:
-    if position == 0:
-        return 1
-    prev = rows[position - 1]
-    cur = rows[position]
-    if cur["right"] == prev["right"]:
-        return rows[position - 1]["rank"]
-    return position + 1
-
-
-# ---------------------------------------------------------------------------
-# PDF
-# ---------------------------------------------------------------------------
-
-PDF_FONT_REGULAR = None
-PDF_FONT_BOLD = None
-
-
-def register_pdf_fonts():
-    global PDF_FONT_REGULAR, PDF_FONT_BOLD
-    candidates = [
-        (
-            BASE_DIR / "fonts" / "NotoSansDevanagari-Regular.ttf",
-            BASE_DIR / "fonts" / "NotoSansDevanagari-Bold.ttf",
-        ),
-        (
-            Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
-            Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"),
-        ),
-    ]
-    for regular, bold in candidates:
-        if regular.exists() and bold.exists():
-            try:
-                pdfmetrics.registerFont(TTFont("ECADevanagari", str(regular)))
-                pdfmetrics.registerFont(TTFont("ECADevanagariBold", str(bold)))
-                PDF_FONT_REGULAR = "ECADevanagari"
-                PDF_FONT_BOLD = "ECADevanagariBold"
-                return
-            except Exception as exc:
-                log.warning("Could not register Devanagari font: %s", exc)
-
-    PDF_FONT_REGULAR = "Helvetica"
-    PDF_FONT_BOLD = "Helvetica-Bold"
-
-
-def pdf_escape(text: str) -> str:
-    return (
-        safe_text(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    added_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
 
-def build_quiz_pdf(quiz: dict) -> Path:
-    register_pdf_fonts()
+class QuestionHistory(Base):
+    __tablename__ = "eca_v3_question_history"
 
-    path = PDF_DIR / f"{quiz['id']}.pdf"
-    styles = getSampleStyleSheet()
-    base_font = PDF_FONT_REGULAR
-    bold_font = PDF_FONT_BOLD
-
-    title = ParagraphStyle(
-        "ECATitle",
-        parent=styles["Title"],
-        fontName=bold_font,
-        fontSize=18,
-        leading=22,
-        alignment=TA_CENTER,
-        spaceAfter=4 * mm,
-    )
-    subtitle = ParagraphStyle(
-        "ECASubtitle",
-        parent=styles["Normal"],
-        fontName=base_font,
-        fontSize=9.5,
-        leading=13,
-        alignment=TA_CENTER,
-        spaceAfter=2 * mm,
-    )
-    heading = ParagraphStyle(
-        "ECAHeading",
-        parent=styles["Heading2"],
-        fontName=bold_font,
-        fontSize=12,
-        leading=16,
-        spaceBefore=5 * mm,
-        spaceAfter=2 * mm,
-    )
-    body = ParagraphStyle(
-        "ECABody",
-        parent=styles["BodyText"],
-        fontName=base_font,
-        fontSize=10.5,
-        leading=15,
-        spaceAfter=2.5 * mm,
-    )
-    small = ParagraphStyle(
-        "ECASmall",
-        parent=styles["BodyText"],
-        fontName=base_font,
-        fontSize=8.5,
-        leading=12,
-        alignment=TA_CENTER,
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    question_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_question: Mapped[str] = mapped_column(Text, nullable=False)
+    topic: Mapped[str] = mapped_column(String(500), nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
-    doc = SimpleDocTemplate(
-        str(path),
-        pagesize=A4,
-        rightMargin=17 * mm,
-        leftMargin=17 * mm,
-        topMargin=15 * mm,
-        bottomMargin=15 * mm,
-        title=f"{quiz['title']} - ETERNAL CIVIL ACADEMY",
-        author="ETERNAL CIVIL ACADEMY",
+
+class Quiz(Base):
+    __tablename__ = "eca_v3_quizzes"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    question_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    language: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
-    story = []
-    story.append(Paragraph("ETERNAL CIVIL ACADEMY", title))
-    story.append(Paragraph("Your Success, Our Commitment", subtitle))
-    story.append(Spacer(1, 2 * mm))
-    story.append(HRFlowable(width="100%", thickness=0.8))
-    story.append(Spacer(1, 4 * mm))
 
-    meta = [
-        ["TEST NO.", quiz.get("test_no", "01")],
-        ["QUIZ TITLE", quiz["title"]],
-        ["TOTAL QUESTIONS", str(len(quiz["questions"]))],
-        ["QUIZ DATE", quiz["quiz_date"]],
-        ["QUIZ TIME", quiz["quiz_time"]],
-        ["TIME PER QUESTION", f"{quiz['question_time']} Seconds"],
-        ["LANGUAGE", quiz["language"]],
-    ]
-    table_data = [
-        [
-            Paragraph(f"<b>{pdf_escape(a)}</b>", body),
-            Paragraph(pdf_escape(str(b)), body),
-        ]
-        for a, b in meta
-    ]
-    t = Table(table_data, colWidths=[45 * mm, 125 * mm])
-    t.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 0.35, None),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]
-        )
-    )
-    story.append(t)
-    story.append(Spacer(1, 5 * mm))
+class QuizQuestion(Base):
+    __tablename__ = "eca_v3_quiz_questions"
 
-    story.append(
-        Paragraph(
-            f'Telegram: <link href="{pdf_escape(ECA_TELEGRAM_URL)}">{pdf_escape(ECA_TELEGRAM_URL)}</link>',
-            small,
-        )
-    )
-    story.append(Spacer(1, 6 * mm))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    quiz_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    question_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    options_json: Mapped[str] = mapped_column(Text, nullable=False)
+    correct_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
 
-    for i, q in enumerate(quiz["questions"], start=1):
-        story.append(
-            Paragraph(
-                f"<b>Question {i}</b><br/>{pdf_escape(q['question'])}",
-                body,
-            )
-        )
-
-        options = q.get("options", [])
-        correct = int(q.get("correct_index", 0))
-        correct_text = options[correct] if 0 <= correct < len(options) else ""
-
-        story.append(
-            Paragraph(
-                f"<b>Right Answer:</b> {pdf_escape(correct_text)}",
-                body,
-            )
-        )
-        story.append(
-            Paragraph(
-                f"<b>Explanation:</b> {pdf_escape(q.get('explanation', ''))}",
-                body,
-            )
-        )
-        if i != len(quiz["questions"]):
-            story.append(Spacer(1, 2 * mm))
-
-    story.append(Spacer(1, 7 * mm))
-    story.append(HRFlowable(width="100%", thickness=0.6))
-    story.append(Spacer(1, 2 * mm))
-    story.append(
-        Paragraph(
-            f"ETERNAL CIVIL ACADEMY | {pdf_escape(ECA_TELEGRAM_URL)}",
-            small,
-        )
+    __table_args__ = (
+        UniqueConstraint("quiz_id", "question_no", name="uq_eca_v3_quiz_question_no"),
     )
 
-    doc.build(story)
-    return path
+
+class QuizRun(Base):
+    __tablename__ = "eca_v3_quiz_runs"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    quiz_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)  # personal/group
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_question: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    leaderboard_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
-# ---------------------------------------------------------------------------
-# Gemini
-# ---------------------------------------------------------------------------
+class QuizPoll(Base):
+    __tablename__ = "eca_v3_quiz_polls"
 
-GEMINI_CLIENT = None
-
-
-def get_gemini_client():
-    global GEMINI_CLIENT
-    if GEMINI_CLIENT is None:
-        if not genai:
-            raise RuntimeError("google-genai package is not installed.")
-        if not GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY is missing.")
-        GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
-    return GEMINI_CLIENT
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    quiz_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    poll_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    question_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    correct_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closes_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-def strip_json_fence(text: str) -> str:
-    text = safe_text(text)
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+class PollAnswer(Base):
+    __tablename__ = "eca_v3_poll_answers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    poll_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    selected_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    answered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("poll_id", "user_id", name="uq_eca_v3_poll_user_answer"),
+    )
 
 
-def validate_questions(data: Any, requested: int) -> list[dict]:
-    if isinstance(data, dict):
-        data = data.get("questions")
-    if not isinstance(data, list):
-        raise ValueError("AI did not return a question list.")
+connect_args: dict[str, Any] = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False, "timeout": 30}
 
-    out = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        question = safe_text(item.get("question"))
-        options = item.get("options")
-        explanation = safe_text(item.get("explanation"))
-        if not question or not isinstance(options, list) or len(options) != 4:
-            continue
-        options = [safe_text(x) for x in options]
-        if any(not x for x in options):
-            continue
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def init_db() -> None:
+    Base.metadata.create_all(engine)
+    if DATABASE_URL.startswith("sqlite"):
         try:
-            ci = int(item.get("correct_index"))
+            with engine.begin() as conn:
+                conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
         except Exception:
-            continue
-        if ci not in range(4):
-            continue
-        if not explanation:
-            continue
-
-        # Reject malformed duplicates.
-        if len({x.casefold() for x in options}) != 4:
-            continue
-
-        out.append(
-            {
-                "question": question,
-                "options": options,
-                "correct_index": ci,
-                "explanation": explanation,
-            }
-        )
-        if len(out) >= requested:
-            break
-
-    if len(out) < requested:
-        raise ValueError(
-            f"Only {len(out)} valid questions were returned; {requested} required."
-        )
-    return out
+            logger.exception("SQLite PRAGMA setup failed; continuing.")
 
 
-def generation_prompt( title: str, requested: int, language: str, source_text: str, ) -> str:
-    language_rule = {
-        "Hindi": "Write the question, four options, and explanation in natural Hindi using Devanagari.",
-        "English": "Write the question, four options, and explanation in clear English.",
-        "Bilingual": "Write each question, its four options, and explanation in a clean Hindi-English bilingual form. Do not use any third language.",
-    }[language]
+# ============================================================
+# Render health server
+# ============================================================
 
-    source_block = source_text.strip()
-    if len(source_block) > 45000:
-        source_block = source_block[:45000]
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = b"ECA Quiz Maker Bot is running"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    return f""" You are the examination-question engine for ETERNAL CIVIL ACADEMY. Create exactly {requested} high-quality single-correct-answer MCQs. Topic: {title} Language: {language} LANGUAGE RULE: {language_rule} IMPORTANT: - Never use emojis. - Never use mojibake, corrupted Unicode, or a third script. - Do not invent facts when a source is supplied. - Prefer the supplied source over general knowledge. - Each question must have exactly 4 distinct options. - correct_index must be 0, 1, 2, or 3. - Explanation must clearly justify the correct answer. - Avoid duplicate questions and duplicate options. - Do not include question numbering in the question text. - Return JSON only, with this exact structure: {{ "questions": [ {{ "question": "...", "options": ["...", "...", "...", "..."], "correct_index": 0, "explanation": "..." }} ] }} SOURCE MATERIAL: {source_block if source_block else "[No source supplied. Use reliable general knowledge about the topic.]"} """.strip()
-
-
-async def generate_questions( title: str, requested: int, language: str, source_text: str, ) -> tuple[list[dict], str]:
-    """ Uses current Gemini models with bounded retry/backoff. 429 does not cause an immediate quiz crash; another configured model is attempted. We never claim unlimited quota. """
-    client = get_gemini_client()
-    prompt = generation_prompt(title, requested, language, source_text)
-    errors = []
-
-    for model in GEMINI_MODELS:
-        for attempt in range(2):
-            try:
-                if genai_types:
-                    cfg = genai_types.GenerateContentConfig(
-                        temperature=0.2,
-                        response_mime_type="application/json",
-                    )
-                    response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model,
-                        contents=prompt,
-                        config=cfg,
-                    )
-                else:
-                    response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model,
-                        contents=prompt,
-                    )
-
-                text = getattr(response, "text", None)
-                if not text:
-                    raise ValueError("Gemini returned an empty response.")
-
-                parsed = json.loads(strip_json_fence(text))
-                questions = validate_questions(parsed, requested)
-                return questions, model
-
-            except Exception as exc:
-                msg = str(exc)
-                errors.append(f"model={model}, attempt={attempt+1}: {msg[:600]}")
-                # Retry only transient-looking failures. A 404 means the model
-                # is unavailable and should move immediately to the next model.
-                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    await asyncio.sleep(2 ** attempt)
-                elif "500" in msg or "503" in msg or "UNAVAILABLE" in msg:
-                    await asyncio.sleep(1.5 * (attempt + 1))
-                else:
-                    break
-
-    raise RuntimeError("AI generation failed after configured models/retries: " + " | ".join(errors))
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
 
 
-# ---------------------------------------------------------------------------
-# Source extraction
-# ---------------------------------------------------------------------------
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
 
-def extract_source_bytes(filename: str, data: bytes) -> str:
-    name = filename.lower()
-    if name.endswith(".pdf"):
-        if not PdfReader:
-            raise RuntimeError("pypdf is not installed.")
-        reader = PdfReader(io.BytesIO(data))
-        parts = []
-        for page in reader.pages:
-            try:
-                parts.append(page.extract_text() or "")
-            except Exception:
-                continue
-        text = "\n".join(parts).strip()
-        if not text:
-            raise ValueError("No readable text was found in the PDF.")
+
+def start_health_server() -> None:
+    try:
+        server = ReusableThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+        logger.info("Render health server listening on 0.0.0.0:%s", PORT)
+        server.serve_forever(poll_interval=0.5)
+    except Exception:
+        logger.exception("Render health server failed to start on port %s", PORT)
+        raise
+
+
+# ============================================================
+# Gemini client pool / quota handling
+# ============================================================
+
+GEMINI_CLIENTS = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
+
+# Short in-process cooldown after a full provider quota failure, preventing
+# accidental rapid-fire admin retries from hammering the same quota.
+AI_COOLDOWN_UNTIL = 0.0
+AI_COOLDOWN_LOCK = threading.Lock()
+
+
+class AIQuotaError(RuntimeError):
+    pass
+
+
+class AITransientError(RuntimeError):
+    pass
+
+
+class AIPermanentError(RuntimeError):
+    pass
+
+
+def classify_ai_error(exc: Exception) -> str:
+    text = str(exc).lower()
+    if any(x in text for x in ("resource_exhausted", "quota", "too many requests", "429")):
+        return "quota"
+    if any(x in text for x in ("503", "502", "504", "temporarily unavailable", "service unavailable", "timeout")):
+        return "transient"
+    if any(x in text for x in ("401", "403", "api key", "permission denied", "unauthenticated", "invalid argument")):
+        return "permanent"
+    return "other"
+
+
+def cooldown_seconds_remaining() -> int:
+    with AI_COOLDOWN_LOCK:
+        remaining = AI_COOLDOWN_UNTIL - time.time()
+    return max(0, int(remaining))
+
+
+def set_ai_cooldown(seconds: int = 45) -> None:
+    global AI_COOLDOWN_UNTIL
+    with AI_COOLDOWN_LOCK:
+        AI_COOLDOWN_UNTIL = max(AI_COOLDOWN_UNTIL, time.time() + seconds)
+
+
+# ============================================================
+# Text helpers / duplicate detection
+# ============================================================
+
+MOJIBAKE_MARKERS = ("Ã Â¤", "Ã Â¥", "Ã°Å¸", "Ã¢", "Ãƒ", "Ã‚")
+
+def repair_mojibake(value: Any) -> str:
+    """Repair common UTF-8-as-Latin-1 mojibake without touching valid Hindi/English.
+
+    This is a defensive guard for copied/stored text. Normal Unicode text is returned unchanged.
+    """
+    text = str(value or "")
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
         return text
-
-    for encoding in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
+    for encoding in ("latin1", "cp1252"):
         try:
-            return data.decode(encoding).strip()
-        except Exception:
-            pass
-    raise ValueError("The source file could not be decoded as text.")
+            candidate = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if candidate and not any(marker in candidate for marker in MOJIBAKE_MARKERS):
+            return candidate
+    return text
 
 
-# ---------------------------------------------------------------------------
-# Quiz state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BuildState:
-    source_name: Optional[str] = None
-    source_text: str = ""
-    title: str = ""
-    count: int = 0
-    language: str = ""
-    start_mode: str = "Personally"
-    question_time: int = DEFAULT_QUESTION_TIME
+PUNCT_RE = re.compile(r"[^\w\s\u0900-\u097F]", flags=re.UNICODE)
+SPACE_RE = re.compile(r"\s+")
 
 
-BUILD_STATES: dict[int, BuildState] = {}
+def normalize(text: str) -> str:
+    text = repair_mojibake(text).strip().lower()
+    text = PUNCT_RE.sub(" ", text)
+    return SPACE_RE.sub(" ", text).strip()
+
+
+def tokens(text: str) -> set[str]:
+    return {x for x in normalize(text).split() if len(x) > 1}
+
+
+def question_similarity(a: str, b: str) -> float:
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    return inter / max(1, min(len(ta), len(tb)))
+
+
+def hash_question(question: str) -> str:
+    return hashlib.sha256(normalize(question).encode("utf-8")).hexdigest()
+
+
+def exact_duplicate_exists(question: str) -> bool:
+    q_hash = hash_question(question)
+    with SessionLocal() as session:
+        row = session.scalar(
+            select(QuestionHistory.id)
+            .where(QuestionHistory.question_hash == q_hash)
+            .limit(1)
+        )
+    return row is not None
+
+
+def similar_previous_question(question: str, threshold: float = 0.84) -> bool:
+    q_tokens = tokens(question)
+    if len(q_tokens) < 4:
+        return exact_duplicate_exists(question)
+
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(QuestionHistory.normalized_question)
+            .order_by(QuestionHistory.id.desc())
+            .limit(MAX_HISTORY_FOR_SIMILARITY)
+        ).all()
+
+    for old in rows:
+        old_tokens = set(old.split())
+        if not old_tokens:
+            continue
+        score = len(q_tokens & old_tokens) / max(1, min(len(q_tokens), len(old_tokens)))
+        if score >= threshold:
+            return True
+    return False
+
+
+def recent_history(limit: int = MAX_HISTORY_FOR_PROMPT) -> list[str]:
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(QuestionHistory.question)
+            .order_by(QuestionHistory.id.desc())
+            .limit(limit)
+        ).all()
+    return list(reversed(rows))
+
+
+def save_history(question: dict[str, Any]) -> None:
+    text = repair_mojibake(question.get("question", "")).strip()
+    if not text:
+        return
+    q_hash = hash_question(text)
+    with SessionLocal() as session:
+        exists = session.scalar(
+            select(QuestionHistory.id)
+            .where(QuestionHistory.question_hash == q_hash)
+            .limit(1)
+        )
+        if exists:
+            return
+        session.add(
+            QuestionHistory(
+                question_hash=q_hash,
+                question=text,
+                normalized_question=normalize(text),
+                topic=str(question.get("topic", ""))[:500],
+                source=str(question.get("source", ""))[:5000],
+            )
+        )
+        session.commit()
+
+
+# ============================================================
+# Authorization / admin commands
+# ============================================================
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_USER_ID
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    if is_owner(user_id):
+        return True
+    with SessionLocal() as session:
+        return session.get(Admin, user_id) is not None
 
 
-# ---------------------------------------------------------------------------
-# Admin UI
-# ---------------------------------------------------------------------------
-
-def admin_menu():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Create Quiz"), KeyboardButton("Help")],
-        ],
-        resize_keyboard=True,
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    username = f"@{user.username}" if user and user.username else "â€”"
+    await update.effective_message.reply_text(
+        f"ðŸ†” Telegram User ID\n{user.id}\n\nUsername: {username}"
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("âŒ Only the Owner can add admins.")
         return
+
+    target_id: Optional[int] = None
+    target_name = ""
+    reply = update.effective_message.reply_to_message
+    if reply and reply.from_user:
+        target_id = reply.from_user.id
+        target_name = reply.from_user.full_name
+    elif context.args:
+        try:
+            target_id = int(context.args[0])
+            target_name = str(target_id)
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        await update.effective_message.reply_text(
+            "à¤•à¤¿à¤¸à¥€ user à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡ /addadmin à¤­à¥‡à¤œà¥‡à¤‚à¥¤\n\n"
+            "à¤¯à¤¾ /addadmin USER_ID"
+        )
+        return
+
+    if target_id == OWNER_USER_ID:
+        await update.effective_message.reply_text("â„¹ï¸ This user is already the Owner.")
+        return
+
+    with SessionLocal() as session:
+        if session.get(Admin, target_id):
+            await update.effective_message.reply_text(f"â„¹ï¸ This user is already an Admin.\nID: {target_id}")
+            return
+        session.add(Admin(user_id=target_id, added_by=OWNER_USER_ID))
+        session.commit()
+
+    await update.effective_message.reply_text(
+        f"âœ… Admin authorized\n\nName: {target_name}\nUser ID: {target_id}"
+    )
+
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("âŒ Only the Owner can remove admins.")
+        return
+
+    target_id: Optional[int] = None
+    reply = update.effective_message.reply_to_message
+    if reply and reply.from_user:
+        target_id = reply.from_user.id
+    elif context.args:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        await update.effective_message.reply_text("Reply to the admin message with /removeadmin.")
+        return
+    if target_id == OWNER_USER_ID:
+        await update.effective_message.reply_text("âŒ The Owner cannot be removed.")
+        return
+
+    with SessionLocal() as session:
+        admin = session.get(Admin, target_id)
+        if not admin:
+            await update.effective_message.reply_text("â„¹ï¸ This user is not an Admin.")
+            return
+        session.delete(admin)
+        session.commit()
+
+    await update.effective_message.reply_text(f"âœ… Admin access removed\nUser ID: {target_id}")
+
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("âŒ Only the Owner can view the admin list.")
+        return
+
+    with SessionLocal() as session:
+        rows = session.scalars(select(Admin).order_by(Admin.added_at)).all()
+
+    lines = ["ðŸ‘‘ ECA QUIZ MAKER ADMINS", "", f"Owner: {OWNER_USER_ID}", "", "Authorized Admins:"]
+    if not rows:
+        lines.append("No additional Admins.")
+    else:
+        lines.extend(f"{i}. {row.user_id}" for i, row in enumerate(rows, 1))
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+# ============================================================
+# URL / file utilities
+# ============================================================
+
+
+def fetch_url_text(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only HTTP/HTTPS URLs are supported.")
+
+    response = requests.get(
+        url,
+        timeout=25,
+        allow_redirects=True,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; ECAQuizMaker/3.0; +https://t.me/EternalCivilAcademy)"
+        },
+    )
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "text/html" not in content_type and "text/plain" not in content_type:
+        raise ValueError("The URL did not return readable HTML/text content.")
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
+        tag.decompose()
+
+    text = soup.get_text("\n", strip=True)
+    text = SPACE_RE.sub(" ", text)
+    if len(text) < 100:
+        raise ValueError("The webpage did not expose enough readable text.")
+    return text[:MAX_SOURCE_TEXT]
+
+
+async def download_message_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
+    message = update.effective_message
+    if message.photo:
+        tg_file = await context.bot.get_file(message.photo[-1].file_id)
+        suffix = ".jpg"
+    elif message.document:
+        tg_file = await context.bot.get_file(message.document.file_id)
+        suffix = Path(message.document.file_name or "source").suffix.lower() or ".bin"
+    else:
+        raise ValueError("No supported file found.")
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    path = temp.name
+    temp.close()
+    await tg_file.download_to_drive(custom_path=path)
+    return path, suffix
+
+
+def cleanup_file(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        logger.warning("Could not clean temporary file: %s", path)
+
+
+# ============================================================
+# Question schema / prompt
+# ============================================================
+
+QUESTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "correct_index": {"type": "integer"},
+                    "explanation": {"type": "string"},
+                    "source": {"type": "string"},
+                    "topic": {"type": "string"},
+                },
+                "required": [
+                    "question",
+                    "options",
+                    "correct_index",
+                    "explanation",
+                    "source",
+                    "topic",
+                ],
+            },
+        }
+    },
+    "required": ["questions"],
+}
+
+
+SYSTEM_INSTRUCTION = """
+You are the senior competitive-exam question setter for Eternal Civil Academy (ECA).
+Target: UPSC, UPPSC/PCS, BPSC, MPPSC, State PCS and similarly serious exams.
+
+NON-NEGOTIABLE:
+- Create ORIGINAL MCQs. Never copy or closely paraphrase a source question.
+- Never repeat previous ECA questions or obvious near-duplicates.
+- Exactly 4 options and exactly 1 correct option.
+- Questions must be objective, unambiguous, exam-standard and factually supportable.
+- Never invent an Article, Act, rule, committee, judgment, report, scheme, statistic, date or institutional fact.
+- Prefer primary/authoritative sources for AI-search mode: government, Parliament, ministries, constitutional/legal texts, RBI, SEBI, UPSC, NCERT, ECI, official reports, UN/World Bank etc. as appropriate.
+- Spread questions across meaningful subtopics, chronology, concepts, provisions, cause-effect, comparison, application and analytical angles.
+- Avoid repeating one narrow factual template. At most 1-2 questions from one narrow subtopic in a batch.
+- Keep each question <=300 characters.
+- Keep each option <=100 characters.
+- Keep each explanation <=200 characters.
+- Explanation must state why the correct option is correct and briefly distinguish the other three options.
+- Quality is more important than count. Return fewer valid questions rather than weak/fabricated ones.
+- Preserve the requested language exactly.
+- Source field must identify the factual basis actually used. Never fabricate a URL.
+- Return only the requested JSON structure.
+
+LANGUAGE:
+Hindi = standard exam Hindi; English technical terms may be placed in brackets.
+English = clear exam-standard English.
+Bilingual = concise Hindi + English without sacrificing factual quality.
+"""
+
+
+def build_prompt(
+    topic: str,
+    count: int,
+    language: str,
+    mode: str,
+    source_text: str = "",
+    history: Optional[list[str]] = None,
+    already_generated: Optional[list[str]] = None,
+) -> str:
+    history = history or []
+    already_generated = already_generated or []
+
+    history_block = "\n".join(f"- {q[:450]}" for q in history[-MAX_HISTORY_FOR_PROMPT:]) or "(No prior questions available.)"
+    current_block = "\n".join(f"- {q[:450]}" for q in already_generated[-50:]) or "(No questions in this request yet.)"
+
+    if mode == "ai":
+        research_block = """
+You MUST use Google Search grounding before finalizing factual claims.
+Prefer official/primary sources. Cross-check important facts when appropriate.
+Do not rely on unsupported memory for current or legal/official facts.
+"""
+    else:
+        research_block = """
+The supplied source is the PRIMARY basis. Use only the supplied material for
+facts unless an additional verification is genuinely necessary. Do not replace
+it with unrelated information. Do not copy any source MCQ.
+"""
+
+    source_block = ""
+    if source_text:
+        source_block = (
+            "\nPRIMARY SOURCE MATERIAL\n"
+            "---------------- START ----------------\n"
+            f"{source_text[:MAX_SOURCE_TEXT]}\n"
+            "---------------- END ----------------\n"
+        )
+
+    return f"""
+Create up to {count} ORIGINAL MCQs.
+
+TOPIC:
+{topic}
+
+REQUESTED LANGUAGE:
+{language}
+
+{research_block}
+
+PREVIOUS ECA QUESTIONS â€” DO NOT REPEAT OR CLOSELY PARAPHRASE:
+{history_block}
+
+QUESTIONS ALREADY CREATED IN THIS REQUEST â€” DO NOT REPEAT:
+{current_block}
+
+DIVERSITY:
+Use different meaningful subtopics/angles. Do not make a list of the same
+factual pattern. If the topic is narrow, return fewer questions.
+
+STRICT OUTPUT:
+Exactly four options. Exactly one correct index (0-3). No ambiguity.
+Every source field must describe the real factual basis.
+{source_block}
+
+Return only valid JSON matching the supplied schema.
+"""
+
+
+# ============================================================
+# Gemini calls
+# ============================================================
+
+
+def _generate_with_client(
+    client: genai.Client,
+    model_name: str,
+    prompt: str,
+    use_search: bool,
+    source_files: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    tools: list[Any] = []
+    if use_search:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.25,
+        max_output_tokens=12000,
+        response_mime_type="application/json",
+        response_schema=QUESTION_SCHEMA,
+        tools=tools or None,
+    )
+
+    contents: list[Any] = [prompt]
+    for path in source_files or []:
+        uploaded = client.files.upload(file=path)
+        contents.append(uploaded)
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=config,
+    )
+    text = getattr(response, "text", None)
+    if not text:
+        raise RuntimeError("Gemini returned an empty response.")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Gemini returned invalid JSON despite structured output.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Gemini response was not a JSON object.")
+    return data
+
+
+async def call_ai(
+    prompt: str,
+    use_search: bool,
+    source_files: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    remaining = cooldown_seconds_remaining()
+    if remaining > 0:
+        raise AIQuotaError(f"AI is temporarily cooling down after a quota failure. Retry in about {remaining}s.")
+
+    models = []
+    for name in [PRIMARY_MODEL] + FALLBACK_MODELS:
+        if name and name not in models:
+            models.append(name)
+
+    last_errors: list[str] = []
+    attempts = 0
+    max_attempts = max(1, AI_MAX_CALLS_PER_REQUEST)
+
+    for key_index, client in enumerate(GEMINI_CLIENTS):
+        for model_name in models:
+            attempts += 1
+            if attempts > max_attempts:
+                break
+            try:
+                result = await asyncio.to_thread(
+                    _generate_with_client,
+                    client,
+                    model_name,
+                    prompt,
+                    use_search,
+                    source_files,
+                )
+                logger.info("Gemini success key=%s model=%s", key_index + 1, model_name)
+                return result
+            except Exception as exc:
+                category = classify_ai_error(exc)
+                last_errors.append(f"key={key_index + 1}, model={model_name}, type={category}")
+                logger.warning(
+                    "Gemini error key=%s model=%s type=%s error=%s",
+                    key_index + 1,
+                    model_name,
+                    category,
+                    str(exc)[:500],
+                )
+
+                if category == "transient":
+                    await asyncio.sleep(AI_RETRY_DELAY)
+                    try:
+                        result = await asyncio.to_thread(
+                            _generate_with_client,
+                            client,
+                            model_name,
+                            prompt,
+                            use_search,
+                            source_files,
+                        )
+                        logger.info("Gemini retry success key=%s model=%s", key_index + 1, model_name)
+                        return result
+                    except Exception as retry_exc:
+                        last_errors.append(
+                            f"key={key_index + 1}, model={model_name}, retry_type={classify_ai_error(retry_exc)}"
+                        )
+                        logger.warning("Gemini retry failed: %s", str(retry_exc)[:500])
+                elif category in ("quota", "permanent"):
+                    continue
+                else:
+                    await asyncio.sleep(1)
+
+        if attempts > max_attempts:
+            break
+
+    quota_seen = any("type=quota" in x or "retry_type=quota" in x for x in last_errors)
+    if quota_seen:
+        set_ai_cooldown(45)
+        raise AIQuotaError(
+            "Gemini quota/rate limit was exhausted across the configured models/keys."
+        )
+    raise AIPermanentError("AI generation failed. Details: " + "; ".join(last_errors[-8:]))
+
+
+# ============================================================
+# Validation / generation
+# ============================================================
+
+
+def valid_question(item: dict[str, Any]) -> bool:
+    try:
+        question = repair_mojibake(item.get("question", "")).strip()
+        options = [repair_mojibake(x).strip() for x in item.get("options", [])]
+        correct_index = int(item.get("correct_index"))
+        explanation = repair_mojibake(item.get("explanation", "")).strip()
+        source = repair_mojibake(item.get("source", "")).strip()
+        topic = repair_mojibake(item.get("topic", "")).strip()
+
+        if not question or len(question) > 300:
+            return False
+        if len(options) != 4:
+            return False
+        if any(not x or len(x) > 100 for x in options):
+            return False
+        if len({normalize(x) for x in options}) != 4:
+            return False
+        if correct_index not in (0, 1, 2, 3):
+            return False
+        if not explanation or len(explanation) > 200:
+            return False
+        if not source or not topic:
+            return False
+        item["question"] = question
+        item["options"] = options
+        item["explanation"] = explanation
+        item["source"] = source
+        item["topic"] = topic
+        return True
+    except Exception:
+        return False
+
+
+def post_validate(
+    candidates: list[dict[str, Any]],
+    accepted: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    accepted = list(accepted or [])
+    subtopic_counts: dict[str, int] = {}
+
+    for old in accepted:
+        key = normalize(str(old.get("topic", "")))
+        subtopic_counts[key] = subtopic_counts.get(key, 0) + 1
+
+    valid: list[dict[str, Any]] = []
+    for item in candidates:
+        if not isinstance(item, dict) or not valid_question(item):
+            continue
+        question = repair_mojibake(item["question"]).strip()
+
+        if exact_duplicate_exists(question) or similar_previous_question(question):
+            continue
+        if any(question_similarity(question, str(x["question"])) >= 0.84 for x in accepted + valid):
+            continue
+
+        subtopic = normalize(str(item.get("topic", "")))
+        if subtopic_counts.get(subtopic, 0) >= 2:
+            continue
+        subtopic_counts[subtopic] = subtopic_counts.get(subtopic, 0) + 1
+        valid.append(item)
+
+    return valid
+
+
+async def make_ai_contents(
+    topic: str,
+    count: int,
+    language: str,
+    mode: str,
+    source_text: str,
+    source_files: Optional[list[str]],
+    history: list[str],
+    already_generated: list[str],
+) -> tuple[str, bool, list[str]]:
+    prompt = build_prompt(
+        topic=topic,
+        count=count,
+        language=language,
+        mode=mode,
+        source_text=source_text,
+        history=history,
+        already_generated=already_generated,
+    )
+    return prompt, mode == "ai", list(source_files or [])
+
+
+async def generate_questions(
+    topic: str,
+    count: int,
+    language: str,
+    mode: str,
+    source_text: str = "",
+    source_files: Optional[list[str]] = None,
+    progress_callback: Optional[Any] = None,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Return (questions, terminal_error_message).
+
+    We deliberately return valid partial output when the provider quota is hit,
+    rather than fabricating or forcing invalid questions.
+    """
+    generated: list[dict[str, Any]] = []
+    source_files = list(source_files or [])
+
+    try:
+        history = recent_history()
+        batch_size = min(20, count)
+        calls = 0
+        while len(generated) < count and calls < AI_MAX_CALLS_PER_REQUEST:
+            remaining = count - len(generated)
+            requested = min(batch_size, remaining)
+            calls += 1
+
+            if progress_callback:
+                await progress_callback(f"â³ AI question batch {calls} à¤¤à¥ˆà¤¯à¤¾à¤° à¤•à¤° à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦ ({len(generated)}/{count})")
+
+            prompt, use_search, source_files_for_call = await make_ai_contents(
+                topic=topic,
+                count=requested,
+                language=language,
+                mode=mode,
+                source_text=source_text,
+                source_files=source_files,
+                history=history,
+                already_generated=[x["question"] for x in generated],
+            )
+
+            try:
+                result = await call_ai(prompt, use_search, source_files_for_call)
+            except AIQuotaError as exc:
+                logger.warning("Quota hit after %s calls: %s", calls, exc)
+                if generated:
+                    return generated[:count], str(exc)
+                return [], str(exc)
+            except Exception as exc:
+                logger.exception("AI generation call failed.")
+                if generated:
+                    return generated[:count], str(exc)
+                return [], str(exc)
+
+            candidates = result.get("questions", [])
+            if not isinstance(candidates, list):
+                candidates = []
+
+            validated = post_validate(candidates, generated)
+            generated.extend(validated[:remaining])
+            history.extend([str(x["question"]) for x in validated])
+
+            # After the first successful batch, smaller second batches allow the
+            # validator to fill gaps without issuing huge outputs.
+            batch_size = min(12, max(4, remaining))
+            if not validated:
+                # No valid new questions from this call. One more call can try a
+                # stronger prompt, but never spin indefinitely.
+                batch_size = min(8, remaining)
+
+            if progress_callback and generated:
+                await progress_callback(f"âœ… {len(generated)}/{count} valid questions are readyâ€¦")
+
+            if not candidates:
+                break
+
+        return generated[:count], None
+    finally:
+        for path in source_files:
+            cleanup_file(path)
+
+
+# ============================================================
+# Conversation state helpers
+# ============================================================
+
+STATE_MODE = 0
+STATE_SOURCE_TYPE = 1
+STATE_SOURCE_CONTENT = 2
+STATE_TOPIC = 3
+STATE_COUNT = 4
+STATE_LANGUAGE = 5
+STATE_START_LOCATION = 6
+STATE_TIME = 7
+STATE_GROUP_START_TIME = 8
+
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "ðŸ“š Quiz creation is available only to the Owner/authorized Admins."
+                )
+            return ConversationHandler.END
+        return await func(update, context)
+    return wrapper
+
+
+# ============================================================
+# /start and workflow
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return ConversationHandler.END
+
+    if not is_admin(user.id):
+        await message.reply_text(
+            "ðŸ“š ECA QUIZ MAKER\n\n"
+            "Quiz creation is available only to the Owner/authorized Admins."
+        )
+        return ConversationHandler.END
 
     args = context.args or []
     if args and args[0].startswith("quiz_"):
         quiz_id = args[0][5:]
-        conn = db()
-        row = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-        conn.close()
-        if not row:
-            await update.message.reply_text("This quiz link is invalid or expired.")
-            return
-        quiz = dict(row)
-        quiz["questions"] = json.loads(quiz["questions_json"])
-        await start_attempt(update, context, quiz)
-        return
+        with SessionLocal() as session:
+            quiz = session.get(Quiz, quiz_id)
+        if not quiz:
+            await message.reply_text("âŒ This quiz link is invalid or the prepared quiz is no longer available.")
+            return ConversationHandler.END
 
-    if is_admin(user.id):
-        await update.message.reply_text(
-            "ECA Quiz Bot is ready.\n\n"
-            "Interface language: English only.\n"
-            "Quiz content: Hindi / English / Bilingual.\n\n"
-            "Use Create Quiz to prepare a new quiz.",
-            reply_markup=admin_menu(),
+        context.user_data["prepared_quiz_id"] = quiz_id
+        context.user_data["topic"] = quiz.title
+        context.user_data["question_count"] = quiz.question_count
+        context.user_data["language"] = quiz.language
+
+        # Deep-link into an actual group: ask time there, not in private chat.
+        if message.chat.type in ("group", "supergroup"):
+            context.user_data["run_mode"] = "group"
+            context.user_data["target_chat_id"] = message.chat.id
+            await message.reply_text(
+                "ðŸŽ¯ QUIZ READY\n\n"
+                f"ðŸ“š Topic: {quiz.title}\n"
+                f"ðŸ”¢ Questions: {quiz.question_count}\n"
+                f"ðŸŒ Language: {quiz.language}\n\n"
+                "â±ï¸ Choose the time allowed for each question:",
+                reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
+            )
+            return STATE_GROUP_START_TIME
+
+        await message.reply_text(
+            "ðŸŽ¯ QUIZ READY\n\n"
+            f"ðŸ“š Topic: {quiz.title}\n"
+            f"ðŸ”¢ Questions: {quiz.question_count}\n"
+            f"ðŸŒ Language: {quiz.language}\n\n"
+            "The quiz is prepared but not published yet. Choose where to start it:",
+            reply_markup=ReplyKeyboardMarkup(
+                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+        return STATE_START_LOCATION
+
+    await message.reply_text(
+        "ðŸ“š ETERNAL CIVIL ACADEMY\n"
+        "QUIZ MAKER\n\n"
+        "What would you like to do?",
+        reply_markup=ReplyKeyboardMarkup(
+            MAIN_BUTTONS,
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+    return STATE_MODE
+
+
+async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    choice = update.effective_message.text.strip()
+
+    if choice == "ðŸ¤– AI Generate Questions":
+        context.user_data["mode"] = "ai"
+        await update.effective_message.reply_text(
+            "Enter the topic.\n\n"
+            "The AI will find authoritative sources, verify facts, and create original questions."
+        )
+        return STATE_TOPIC
+
+    if choice == "ðŸ“š I Will Provide Source":
+        context.user_data["mode"] = "source"
+        await update.effective_message.reply_text(
+            "Choose the source type:",
+            reply_markup=ReplyKeyboardMarkup(
+                SOURCE_TYPE_BUTTONS,
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+        return STATE_SOURCE_TYPE
+
+    await update.effective_message.reply_text("Please choose one of the available options.")
+    return STATE_MODE
+
+
+async def choose_source_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    choice = update.effective_message.text.strip()
+    mapping = {
+        "ðŸ“„ PDF": "pdf",
+        "ðŸ–¼ Photo": "photo",
+        "ðŸ“ Text": "text",
+        "ðŸ“Š Telegram Poll": "poll",
+        "ðŸ”— URL": "url",
+    }
+    source_type = mapping.get(choice)
+    if not source_type:
+        await update.effective_message.reply_text("Please choose a source type.")
+        return STATE_SOURCE_TYPE
+
+    context.user_data["source_type"] = source_type
+    if source_type == "text":
+        await update.effective_message.reply_text("Send the source text now.")
+    elif source_type == "url":
+        await update.effective_message.reply_text("Send an accessible webpage URL now.")
+    elif source_type == "poll":
+        await update.effective_message.reply_text(
+            "Forward or send Telegram Polls here. You can send more than one; press âœ… Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+    elif source_type == "pdf":
+        await update.effective_message.reply_text(
+            "Send the PDF files here. You can send more than one; press âœ… Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     else:
-        await update.message.reply_text(
-            "Welcome to ETERNAL CIVIL ACADEMY Quiz Bot.\n"
-            "Use the quiz link provided by the academy to start a quiz."
+        await update.effective_message.reply_text(
+            "Send clear page photos here. You can send more than one; press âœ… Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
+    return STATE_SOURCE_CONTENT
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user:
-        return
+async def receive_source_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "Use the prepared quiz link to attempt a quiz."
+        return ConversationHandler.END
+
+    text = update.effective_message.text.strip()
+    source_type = context.user_data.get("source_type")
+
+    if source_type in ("pdf", "photo", "poll"):
+        if text == "âœ… Source Ready":
+            if source_type in ("pdf", "photo") and not context.user_data.get("source_files"):
+                await update.effective_message.reply_text("âŒ Send at least one file first.")
+                return STATE_SOURCE_CONTENT
+            if source_type == "poll" and not context.user_data.get("source_text"):
+                await update.effective_message.reply_text("âŒ Send at least one Telegram Poll first.")
+                return STATE_SOURCE_CONTENT
+            await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
+            return STATE_TOPIC
+        await update.effective_message.reply_text("Keep sending source files/polls. Press âœ… Source Ready when finished.")
+        return STATE_SOURCE_CONTENT
+
+    if source_type == "url":
+        if not re.match(r"^https?://", text, flags=re.I):
+            await update.effective_message.reply_text("âŒ Send a valid http/https URL.")
+            return STATE_SOURCE_CONTENT
+        await update.effective_message.reply_text("â³ Reading URL contentâ€¦")
+        try:
+            content = await asyncio.to_thread(fetch_url_text, text)
+        except Exception as exc:
+            logger.exception("URL fetch failed.")
+            await update.effective_message.reply_text(f"âŒ The URL could not be read.\n\nReason: {str(exc)[:500]}")
+            return STATE_SOURCE_CONTENT
+        context.user_data["source_text"] = content
+        context.user_data["source_summary"] = text
+        await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
+        return STATE_TOPIC
+
+    # plain text source
+    if len(text) < 20:
+        await update.effective_message.reply_text("âŒ The source is too short. Please provide more source material.")
+        return STATE_SOURCE_CONTENT
+    context.user_data["source_text"] = text[:MAX_SOURCE_TEXT]
+    context.user_data["source_summary"] = "User-supplied text"
+    await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
+    return STATE_TOPIC
+
+
+async def receive_source_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    source_type = context.user_data.get("source_type")
+
+    if source_type == "poll" and update.effective_message.poll:
+        poll: Poll = update.effective_message.poll
+        options = [x.text for x in poll.options]
+        correct_index = getattr(poll, "correct_option_id", None)
+        explanation = getattr(poll, "explanation", None)
+        parts = [f"Question: {poll.question}", "", "Options:"]
+        parts.extend(f"{chr(65+i)}. {opt}" for i, opt in enumerate(options))
+        if correct_index is not None:
+            parts.append(f"Available correct option: {chr(65 + correct_index)}")
+        if explanation:
+            parts.append(f"Explanation: {explanation}")
+        old = context.user_data.get("source_text", "")
+        joined = (old + "\n\n--- Telegram Poll Source ---\n" + "\n".join(parts)).strip()
+        context.user_data["source_text"] = joined[:MAX_SOURCE_TEXT]
+        context.user_data["source_summary"] = "One or more Telegram Poll sources"
+        await update.effective_message.reply_text(
+            "âœ… Poll source received.\n\nYou can send more Polls. Press âœ… Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
-        return
-    await update.message.reply_text(
-        "Admin commands:\n"
-        "/newquiz - create a quiz\n"
-        "/cancel - cancel the current setup\n"
-        "/publish QUIZ_ID - publish a prepared quiz link to QUIZ_CHAT_ID\n\n"
-        "The bot UI is English-only. Quiz content can be Hindi, English or Bilingual."
-    )
+        return STATE_SOURCE_CONTENT
 
-
-async def newquiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    BUILD_STATES[update.effective_user.id] = BuildState()
-    await update.message.reply_text(
-        "Send the source PDF/text file first.\n"
-        "If you do not want to use a source, send: NO SOURCE",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user:
-        BUILD_STATES.pop(update.effective_user.id, None)
-    await update.message.reply_text("Operation cancelled.", reply_markup=admin_menu())
-
-
-async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    state = BUILD_STATES.get(user.id)
-    if not state:
-        return
-
-    doc = update.message.document
-    if not doc:
-        return
-
-    filename = doc.file_name or "source.txt"
-    if not filename.lower().endswith((".pdf", ".txt", ".md")):
-        await update.message.reply_text("Please send a PDF, TXT or MD source file.")
-        return
-
-    tg_file = await context.bot.get_file(doc.file_id)
-    data = await tg_file.download_as_bytearray()
+    if source_type == "pdf":
+        if not update.effective_message.document or (Path(update.effective_message.document.file_name or "").suffix.lower() != ".pdf"):
+            await update.effective_message.reply_text("âŒ PDF mode accepts PDF files only.")
+            return STATE_SOURCE_CONTENT
+    elif source_type == "photo":
+        if not update.effective_message.photo:
+            await update.effective_message.reply_text("âŒ Photo mode accepts image files only.")
+            return STATE_SOURCE_CONTENT
+    else:
+        await update.effective_message.reply_text("âŒ Send the correct source type.")
+        return STATE_SOURCE_CONTENT
 
     try:
-        text = extract_source_bytes(filename, bytes(data))
-    except Exception as exc:
-        await update.message.reply_text(f"Source could not be read: {exc}")
-        return
+        path, suffix = await download_message_file(update, context)
+    except Exception:
+        logger.exception("File download failed.")
+        await update.effective_message.reply_text("âŒ The file could not be received.")
+        return STATE_SOURCE_CONTENT
 
-    state.source_name = filename
-    state.source_text = text
-    await update.message.reply_text(
-        "Source Ready\n\nNow enter the topic."
+    paths = context.user_data.setdefault("source_files", [])
+    paths.append(path)
+    context.user_data["source_summary"] = f"{len(paths)} {source_type} source file(s)"
+    await update.effective_message.reply_text(
+        f"âœ… Received {len(paths)} source file(s).\n\nYou can send more pages/files. Press âœ… Source Ready when finished.",
+        reply_markup=ReplyKeyboardMarkup([["âœ… Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+    )
+    return STATE_SOURCE_CONTENT
+
+
+async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    topic = update.effective_message.text.strip()
+    if len(topic) < 2:
+        await update.effective_message.reply_text("âŒ Please enter a valid topic.")
+        return STATE_TOPIC
+    context.user_data["topic"] = topic
+    await update.effective_message.reply_text("How many questions do you need?\n\nEnter a number from 1 to 100.")
+    return STATE_COUNT
+
+
+async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        count = int(update.effective_message.text.strip())
+    except ValueError:
+        await update.effective_message.reply_text("âŒ Enter a number only.")
+        return STATE_COUNT
+    if not 1 <= count <= MAX_QUESTIONS:
+        await update.effective_message.reply_text(f"âŒ The number must be between 1 and {MAX_QUESTIONS}.")
+        return STATE_COUNT
+    context.user_data["question_count"] = count
+    await update.effective_message.reply_text(
+        "Choose quiz language:",
+        reply_markup=ReplyKeyboardMarkup(LANGUAGE_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return STATE_LANGUAGE
+
+
+async def receive_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    language = LANGUAGE_LABELS.get(update.effective_message.text.strip())
+    if not language:
+        await update.effective_message.reply_text("Choose Hindi, English, or Bilingual.")
+        return STATE_LANGUAGE
+    context.user_data["language"] = language
+    return await prepare_quiz(update, context)
+
+
+# ============================================================
+# Prepare quiz, but do not publish questions
+# ============================================================
+
+async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    message = update.effective_message
+    topic = context.user_data.get("topic", "")
+    count = int(context.user_data.get("question_count", 0))
+    language = context.user_data.get("language", "")
+    mode = context.user_data.get("mode", "ai")
+    source_text = context.user_data.get("source_text", "")
+    source_files = list(context.user_data.get("source_files", []))
+
+    status = await message.reply_text(
+        "â³ Preparing the quizâ€¦\n"
+        "Questions will not be published yet.\n\n"
+        "Running source verification, originality, and duplicate checksâ€¦"
     )
 
+    async def progress(text: str) -> None:
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
 
-async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-
-    text = safe_text(update.message.text)
-    if text == "Create Quiz":
-        await newquiz_cmd(update, context)
-        return
-    if text == "Help":
-        await help_cmd(update, context)
-        return
-
-    state = BUILD_STATES.get(user.id)
-    if not state:
-        return
-
-    # Step 1: source
-    if not state.title and not state.source_name and not state.source_text:
-        if text.upper() == "NO SOURCE":
-            state.source_text = ""
-            state.source_name = None
-            await update.message.reply_text("Now enter the topic.")
-        return
-
-    # Step 2: topic
-    if not state.title:
-        state.title = text[:300]
-        await update.message.reply_text(
-            "How many questions do you need?\n\nEnter a number from 1 to 100."
+    try:
+        questions, terminal_error = await generate_questions(
+            topic=topic,
+            count=count,
+            language=language,
+            mode=mode,
+            source_text=source_text,
+            source_files=source_files,
+            progress_callback=progress,
         )
-        return
 
-    # Step 3: count
-    if state.count == 0:
-        if not text.isdigit() or not (1 <= int(text) <= MAX_QUESTIONS):
-            await update.message.reply_text(
-                f"Enter a valid number from 1 to {MAX_QUESTIONS}."
+        if not questions:
+            if terminal_error and "quota" in terminal_error.lower():
+                await status.edit_text(
+                    "âŒ Gemini quota is currently unavailable.\n\n"
+                    "All configured Gemini models/keys returned a quota/rate-limit error.\n"
+                    "The bot did not continue with fake or unchecked questions."
+                )
+            else:
+                await status.edit_text(
+                    "âŒ No valid question could be prepared.\n\n"
+                    "The quality/verification checks did not pass, so the quiz was not published.\n"
+                    "Please make the topic/source more specific and try again."
+                )
+            return ConversationHandler.END
+
+        quiz_id = f"eca-{uuid.uuid4().hex[:24]}"
+        source_summary = str(context.user_data.get("source_summary", ""))[:5000]
+        with SessionLocal() as session:
+            session.add(
+                Quiz(
+                    id=quiz_id,
+                    created_by=user.id,
+                    title=topic,
+                    question_count=len(questions),
+                    language=language,
+                    source_mode=mode,
+                    source_summary=source_summary,
+                )
             )
-            return
-        state.count = int(text)
-        await update.message.reply_text(
-            "Choose quiz language:",
+            for idx, item in enumerate(questions, 1):
+                session.add(
+                    QuizQuestion(
+                        quiz_id=quiz_id,
+                        question_no=idx,
+                        question_text=repair_mojibake(item["question"]),
+                        options_json=json.dumps([repair_mojibake(x) for x in item["options"]], ensure_ascii=False),
+                        correct_index=int(item["correct_index"]),
+                        explanation=repair_mojibake(item["explanation"]),
+                        source=repair_mojibake(item["source"]),
+                    )
+                )
+            session.commit()
+
+        for item in questions:
+            try:
+                save_history(item)
+            except Exception:
+                logger.exception("Question history save failed for a generated question.")
+
+        context.user_data["prepared_quiz_id"] = quiz_id
+
+        bot = await context.bot.get_me()
+        personal_link = f"https://t.me/{bot.username}?start=quiz_{quiz_id}"
+
+        partial = ""
+        if len(questions) < count:
+            partial = (
+                f"\n\nâš ï¸ Requested: {count}\n"
+                f"âœ… Verified/valid: {len(questions)}\n"
+                "Fewer questions were kept because quality/verification was not bypassed."
+            )
+            if terminal_error and "quota" in terminal_error.lower():
+                partial += "\n\nGemini quota stopped further generation."
+
+        await status.edit_text(
+            "âœ… QUIZ READY\n\n"
+            f"ðŸ“š Topic: {topic}\n"
+            f"ðŸ”¢ Questions: {len(questions)}\n"
+            f"ðŸŒ Language: {language}"
+            f"{partial}\n\n"
+            "Questions have not been published as a batch.\n"
+            "Choose the start location first, then the time per question.\n\n"
+            f"ðŸ”— Prepared Quiz Link:\n{personal_link}"
+        )
+
+        await message.reply_text(
+            "ðŸ“ Where should the quiz start?",
             reply_markup=ReplyKeyboardMarkup(
-                [
-                    [KeyboardButton("Hindi"), KeyboardButton("English")],
-                    [KeyboardButton("Bilingual")],
-                ],
+                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             ),
         )
-        return
+        return STATE_START_LOCATION
+    except Exception:
+        logger.exception("Quiz preparation failed.")
+        await status.edit_text("âŒ An unexpected error occurred while preparing the quiz. Check the Render logs for technical details.")
+        return ConversationHandler.END
+    finally:
+        # generate_questions() itself cleans the source file.
+        context.user_data.pop("source_files", None)
 
-    # Step 4: language
-    if not state.language:
-        lang = normalize_language(text)
-        if lang not in {"Hindi", "English", "Bilingual"}:
-            await update.message.reply_text("Choose Hindi, English or Bilingual.")
-            return
-        state.language = lang
-        await update.message.reply_text(
-            "Where should the quiz start?",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("Personally"), KeyboardButton("Group/Channel")]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
+
+# ============================================================
+# Start location / timer
+# ============================================================
+
+async def choose_start_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    choice = update.effective_message.text.strip()
+    quiz_id = context.user_data.get("prepared_quiz_id")
+    if not quiz_id:
+        await update.effective_message.reply_text("âŒ Prepared quiz not found. Start again with /start.")
+        return ConversationHandler.END
+
+    if choice == "ðŸ‘¤ Personally":
+        if update.effective_chat.type != "private":
+            await update.effective_message.reply_text("âŒ Personal mode must be started in the bot's private chat.")
+            return STATE_START_LOCATION
+        context.user_data["run_mode"] = "personal"
+        context.user_data["target_chat_id"] = update.effective_chat.id
+
+        await update.effective_message.reply_text(
+            "â±ï¸ Choose the time allowed for each question.\n\n"
+            "The next question will start automatically when the time ends.",
+            reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
         )
-        return
+        return STATE_TIME
 
-    # Step 5: start mode
-    if state.start_mode == "Personally":
-        # We need a sentinel because Personally is the default.
-        state.start_mode = ""
-    if state.start_mode == "":
-        if text not in {"Personally", "Group/Channel"}:
-            await update.message.reply_text(
-                "Choose Personally or Group/Channel."
+    if choice == "ðŸ‘¥ Group":
+        if update.effective_chat.type in ("group", "supergroup"):
+            context.user_data["run_mode"] = "group"
+            context.user_data["target_chat_id"] = update.effective_chat.id
+            await update.effective_message.reply_text(
+                "â±ï¸ Choose the time allowed for each question.",
+                reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
             )
-            return
-        state.start_mode = text
-        await update.message.reply_text(
-            "Choose the time allowed for each question.\n\n"
-            "Enter seconds, for example: 30"
-        )
-        return
+            return STATE_TIME
 
-    # Step 6: timer
-    if state.question_time == DEFAULT_QUESTION_TIME:
-        if not text.isdigit() or not (5 <= int(text) <= 600):
-            await update.message.reply_text(
-                "Enter a valid time from 5 to 600 seconds."
+        bot = await context.bot.get_me()
+        group_link = f"https://t.me/{bot.username}?startgroup=quiz_{quiz_id}"
+        await update.effective_message.reply_text(
+            "ðŸ‘¥ Group mode selected.\n\n"
+            "Add the bot to the group where you want to run the quiz and use the link below.\n\n"
+            f"ðŸ”— Group Start Link:\n{group_link}\n\n"
+            "When the quiz starts in the group, the timer will be selected there.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    await update.effective_message.reply_text("Please choose Personally or Group.")
+    return STATE_START_LOCATION
+
+
+async def choose_question_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    seconds = TIME_OPTIONS.get(update.effective_message.text.strip())
+    if not seconds:
+        await update.effective_message.reply_text("Choose 15 seconds, 25 seconds, 30 seconds, or 1 minute.")
+        return STATE_TIME
+
+    return await start_run_after_timer(update, context, seconds)
+
+
+async def choose_group_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    seconds = TIME_OPTIONS.get(update.effective_message.text.strip())
+    if not seconds:
+        await update.effective_message.reply_text("Choose 15 seconds, 25 seconds, 30 seconds, or 1 minute.")
+        return STATE_GROUP_START_TIME
+    return await start_run_after_timer(update, context, seconds)
+
+
+async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TYPE, seconds: int) -> int:
+    quiz_id = context.user_data.get("prepared_quiz_id")
+    mode = context.user_data.get("run_mode")
+    target_chat_id = context.user_data.get("target_chat_id")
+
+    if not quiz_id or mode not in ("personal", "group") or not target_chat_id:
+        await update.effective_message.reply_text("âŒ Quiz run details are incomplete. Start again with /start.")
+        return ConversationHandler.END
+
+    # Make sure quiz still exists and has questions.
+    with SessionLocal() as session:
+        quiz = session.get(Quiz, quiz_id)
+        q_count = session.scalar(select(QuizQuestion.id).where(QuizQuestion.quiz_id == quiz_id).limit(1))
+    if not quiz or q_count is None:
+        await update.effective_message.reply_text("âŒ This prepared quiz is no longer available.")
+        return ConversationHandler.END
+
+    run_id = f"{quiz_id}-run-{uuid.uuid4().hex[:18]}"
+    with SessionLocal() as session:
+        session.add(
+            QuizRun(
+                id=run_id,
+                quiz_id=quiz_id,
+                target_chat_id=int(target_chat_id),
+                started_by=update.effective_user.id,
+                mode=mode,
+                interval_seconds=seconds,
+                current_question=0,
+                active=True,
+                started_at=datetime.now(timezone.utc),
+                leaderboard_sent=False,
             )
-            return
-        state.question_time = int(text)
-        await prepare_quiz(update, context, state)
-        BUILD_STATES.pop(user.id, None)
-
-
-async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE, state: BuildState):
-    await update.message.reply_text(
-        "Preparing quiz...\n"
-        "Generating, validating and checking all questions before publication."
-    )
-
-    try:
-        questions, model = await generate_questions(
-            state.title,
-            state.count,
-            state.language,
-            state.source_text,
         )
+        session.commit()
 
-        created = now_local()
-        quiz_id = uuid.uuid4().hex[:12]
-        quiz = {
-            "id": quiz_id,
-            "test_no": next_test_number(),
-            "title": state.title,
-            "source_name": state.source_name,
-            "language": state.language,
-            "question_time": state.question_time,
-            "questions": questions,
-            "created_at": created.isoformat(),
-            "quiz_date": created.strftime("%d %B %Y"),
-            "quiz_time": created.strftime("%I:%M %p"),
-        }
-
-        conn = db()
-        conn.execute(
-            """ INSERT INTO quizzes (id,title,source_name,source_text,language,question_time, questions_json,created_at,quiz_date,quiz_time) VALUES (?,?,?,?,?,?,?,?,?,?) """,
-            (
-                quiz_id,
-                quiz["title"],
-                quiz["source_name"],
-                state.source_text,
-                quiz["language"],
-                quiz["question_time"],
-                json.dumps(questions, ensure_ascii=False),
-                quiz["created_at"],
-                quiz["quiz_date"],
-                quiz["quiz_time"],
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        deep_link = f"https://t.me/{context.bot.username}?start=quiz_{quiz_id}"
-
-        await update.message.reply_text(
-            "QUIZ READY\n\n"
-            f"Topic: {state.title}\n"
-            f"Questions: {len(questions)}\n"
-            f"Language: {state.language}\n"
-            f"Model: {model}\n\n"
-            "Questions have passed the preparation checks.\n"
-            "Prepared Quiz Link:\n"
-            f"{deep_link}",
-            disable_web_page_preview=True,
-            reply_markup=admin_menu(),
-        )
-
-    except Exception as exc:
-        log.exception("Quiz preparation failed")
-        await update.message.reply_text(
-            "Error: The quiz could not be prepared.\n\n"
-            "No incomplete quiz was published.\n\n"
-            f"Reason: {clean_ui_text(str(exc))[:3500]}",
-            reply_markup=admin_menu(),
-        )
-
-
-def next_test_number() -> str:
-    conn = db()
-    row = conn.execute("SELECT COUNT(*) AS n FROM quizzes").fetchone()
-    conn.close()
-    return f"{int(row['n']) + 1:02d}"
-
-
-# ---------------------------------------------------------------------------
-# Quiz attempting
-# ---------------------------------------------------------------------------
-
-async def handle_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-
-    args = context.args or []
-    if not args or not args[0].startswith("quiz_"):
-        return
-
-    quiz_id = args[0][5:]
-    conn = db()
-    row = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-    conn.close()
-
-    if not row:
-        await update.message.reply_text("This quiz link is invalid or expired.")
-        return
-
-    quiz = dict(row)
-    quiz["questions"] = json.loads(quiz["questions_json"])
-
-    await start_attempt(update, context, quiz)
-
-
-async def start_attempt(update: Update, context: ContextTypes.DEFAULT_TYPE, quiz: dict):
-    user = update.effective_user
-    conn = db()
-    existing = conn.execute(
-        "SELECT * FROM attempts WHERE quiz_id=? AND user_id=?",
-        (quiz["id"], user.id),
-    ).fetchone()
-
-    if existing and existing["completed"]:
-        conn.close()
-        await update.message.reply_text(
-            "You have already completed this quiz."
-        )
-        return
-
-    if not existing:
-        conn.execute(
-            """ INSERT INTO attempts (quiz_id,user_id,username,display_name,completed,current_index,started_at) VALUES (?,?,?,?,0,0,?) """,
-            (
-                quiz["id"],
-                user.id,
-                user.username,
-                user_display_name(user),
-                now_local().isoformat(),
-            ),
-        )
-        conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"QUIZ STARTING\n\n"
-        f"Time per question: {quiz['question_time']} seconds\n"
-        "The next question starts automatically when time expires.\n"
-        "Questions are sent one at a time.",
+    await update.effective_message.reply_text(
+        "ðŸš€ QUIZ STARTING\n\n"
+        f"â±ï¸ Time per question: {seconds} seconds\n"
+        "âž¡ï¸ The next question starts automatically when time expires.\n"
+        "âŒ Questions will not be sent all at once.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await send_next_question(context, quiz["id"], user.id)
+
+    context.user_data.clear()
+    try:
+        await send_next_question(context, run_id)
+    except Exception:
+        logger.exception("Initial quiz question failed for run=%s", run_id)
+        await update.effective_message.reply_text("âŒ The quiz could not be started.")
+    return ConversationHandler.END
 
 
-async def send_next_question(context: ContextTypes.DEFAULT_TYPE, quiz_id: str, user_id: int):
-    conn = db()
-    qrow = conn.execute(
-        "SELECT * FROM attempts WHERE quiz_id=? AND user_id=?",
-        (quiz_id, user_id),
-    ).fetchone()
-    quizrow = conn.execute(
-        "SELECT * FROM quizzes WHERE id=?", (quiz_id,)
-    ).fetchone()
-    conn.close()
+# ============================================================
+# One-question-at-a-time scheduler
+# ============================================================
 
-    if not qrow or not quizrow:
+async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) -> None:
+    with SessionLocal() as session:
+        run = session.get(QuizRun, run_id)
+        if not run or not run.active:
+            return
+        quiz = session.get(Quiz, run.quiz_id)
+        if not quiz:
+            run.active = False
+            session.commit()
+            return
+
+        next_no = run.current_question + 1
+        question = session.scalar(
+            select(QuizQuestion)
+            .where(QuizQuestion.quiz_id == run.quiz_id, QuizQuestion.question_no == next_no)
+            .limit(1)
+        )
+
+        if not question:
+            run.active = False
+            run.completed_at = datetime.now(timezone.utc)
+            session.commit()
+            # Finish outside DB transaction.
+            target_chat_id = run.target_chat_id
+            completed_text = await asyncio.to_thread(build_leaderboard, run_id)
+            await safe_send_message(
+                context.bot,
+                target_chat_id,
+                "ðŸ QUIZ COMPLETED\n\n"
+                "All questions have been completed.\n\n"
+                f"{completed_text}",
+            )
+            return
+
+        options = json.loads(question.options_json)
+        if not isinstance(options, list) or len(options) != 4:
+            run.active = False
+            session.commit()
+            await safe_send_message(
+                context.bot,
+                run.target_chat_id,
+                f"âŒ Question {next_no} could not be published because its stored options are invalid.",
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        closes = now + timedelta(seconds=run.interval_seconds)
+        target = run.target_chat_id
+        interval = run.interval_seconds
+        correct_index = question.correct_index
+        explanation = repair_mojibake(question.explanation)
+        question_text = repair_mojibake(question.question_text)
+        topic = repair_mojibake(quiz.title)
+
+    try:
+        message = await context.bot.send_poll(
+            chat_id=target,
+            question=question_text[:300],
+            options=[str(x)[:100] for x in options],
+            type="quiz",
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            allows_revoting=False,
+            correct_option_id=correct_index,
+            explanation=explanation[:200],
+            description=(
+                f"ðŸ“š ECA QUIZ | {topic}\n"
+                f"Question {next_no}\n\n"
+                f"{SOURCE_FOOTER}"
+            )[:1024],
+            open_period=interval,
+        )
+    except (RetryAfter, TimedOut, NetworkError) as exc:
+        logger.warning("Telegram transient send_poll failure run=%s: %s", run_id, exc)
+        # Retry once after RetryAfter-provided delay if available.
+        delay = float(getattr(exc, "retry_after", 2)) if isinstance(exc, RetryAfter) else 2.0
+        await asyncio.sleep(min(delay, 10.0))
+        message = await context.bot.send_poll(
+            chat_id=target,
+            question=question_text[:300],
+            options=[str(x)[:100] for x in options],
+            type="quiz",
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            allows_revoting=False,
+            correct_option_id=correct_index,
+            explanation=explanation[:200],
+            description=(
+                f"ðŸ“š ECA QUIZ | {topic}\n"
+                f"Question {next_no}\n\n"
+                f"{SOURCE_FOOTER}"
+            )[:1024],
+            open_period=interval,
+        )
+    except (Forbidden, BadRequest) as exc:
+        logger.exception("Telegram rejected poll for run=%s", run_id)
+        with SessionLocal() as session:
+            run = session.get(QuizRun, run_id)
+            if run:
+                run.active = False
+                session.commit()
+        await safe_send_message(
+            context.bot,
+            target,
+            "âŒ Telegram rejected the quiz poll.\n\n"
+            "Give the bot the required group permissions, or try Personal mode.",
+        )
         return
 
-    quiz = dict(quizrow)
-    quiz["questions"] = json.loads(quiz["questions_json"])
-    idx = int(qrow["current_index"])
+    if not message.poll:
+        raise RuntimeError("Telegram send_poll succeeded but returned no Poll object.")
 
-    if idx >= len(quiz["questions"]):
-        await complete_attempt(context, quiz, user_id)
+    with SessionLocal() as session:
+        run = session.get(QuizRun, run_id)
+        if not run or not run.active:
+            return
+        session.add(
+            QuizPoll(
+                run_id=run_id,
+                quiz_id=run.quiz_id,
+                poll_id=message.poll.id,
+                question_no=next_no,
+                correct_index=correct_index,
+                question_text=question_text,
+                opened_at=now,
+                closes_at=closes,
+            )
+        )
+        run.current_question = next_no
+        session.commit()
+
+    if context.job_queue:
+        context.job_queue.run_once(
+            send_next_question_job,
+            when=interval + 0.5,
+            data={"run_id": run_id},
+            name=f"eca-next-{run_id}-{next_no}",
+        )
+
+
+async def send_next_question_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data if context.job else None
+    if not data:
         return
-
-    q = quiz["questions"][idx]
-    poll = await context.bot.send_poll(
-        chat_id=user_id,
-        question=f"ECA QUIZ | {quiz['title']}\nQuestion {idx + 1}",
-        options=q["options"],
-        type="quiz",
-        correct_option_id=int(q["correct_index"]),
-        is_anonymous=False,
-        explanation=q.get("explanation", "")[:200],
-    )
-
-    conn = db()
-    conn.execute(
-        "INSERT OR REPLACE INTO poll_map(poll_id,quiz_id,q_index) VALUES(?,?,?)",
-        (poll.poll.id, quiz_id, idx),
-    )
-    conn.commit()
-    conn.close()
-
-    # One timer job per user/question.
-    context.job_queue.run_once(
-        question_timeout,
-        when=quiz["question_time"],
-        data={"quiz_id": quiz_id, "user_id": user_id, "q_index": idx},
-        name=f"timeout:{quiz_id}:{user_id}:{idx}",
-    )
+    await send_next_question(context, str(data["run_id"]))
 
 
-async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    quiz_id = data["quiz_id"]
-    user_id = data["user_id"]
-    q_index = data["q_index"]
+# ============================================================
+# Poll answers / leaderboard
+# ============================================================
 
-    conn = db()
-    attempt = conn.execute(
-        "SELECT * FROM attempts WHERE quiz_id=? AND user_id=?",
-        (quiz_id, user_id),
-    ).fetchone()
-    already = conn.execute(
-        "SELECT 1 FROM answers WHERE quiz_id=? AND user_id=? AND q_index=?",
-        (quiz_id, user_id, q_index),
-    ).fetchone()
-
-    if not attempt or int(attempt["completed"]) or already:
-        conn.close()
-        return
-
-    conn.execute(
-        """ INSERT INTO answers (quiz_id,user_id,q_index,selected,correct,answered_at) VALUES (?,?,?,?,?,?) """,
-        (quiz_id, user_id, q_index, None, 0, now_local().isoformat()),
-    )
-    conn.execute(
-        """ UPDATE attempts SET current_index=current_index+1 WHERE quiz_id=? AND user_id=? """,
-        (quiz_id, user_id),
-    )
-    conn.commit()
-    conn.close()
-
-    await send_next_question(context, quiz_id, user_id)
-
-
-async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     answer = update.poll_answer
-    if not answer:
+    if not answer or not answer.user:
         return
-
-    conn = db()
-    mapping = conn.execute(
-        "SELECT * FROM poll_map WHERE poll_id=?", (answer.poll_id,)
-    ).fetchone()
-    if not mapping:
-        conn.close()
+    # Empty option_ids means vote was retracted. Since revoting is disabled,
+    # simply ignore it.
+    if not answer.option_ids:
         return
+    selected_index = int(answer.option_ids[0])
 
-    quiz_id = mapping["quiz_id"]
-    q_index = int(mapping["q_index"])
-    user_id = answer.user.id
+    with SessionLocal() as session:
+        poll_row = session.scalar(select(QuizPoll).where(QuizPoll.poll_id == answer.poll_id).limit(1))
+        if not poll_row:
+            return
+        now = datetime.now(timezone.utc)
+        if now > poll_row.closes_at:
+            return
 
-    quizrow = conn.execute(
-        "SELECT * FROM quizzes WHERE id=?", (quiz_id,)
-    ).fetchone()
-    if not quizrow:
-        conn.close()
-        return
+        is_correct = selected_index == poll_row.correct_index
+        user = answer.user
+        user_name = user.full_name or user.username or str(user.id)
 
-    questions = json.loads(quizrow["questions_json"])
-    q = questions[q_index]
-    selected = answer.option_ids[0] if answer.option_ids else None
-    correct = int(selected == int(q["correct_index"])) if selected is not None else 0
-
-    exists = conn.execute(
-        "SELECT 1 FROM answers WHERE quiz_id=? AND user_id=? AND q_index=?",
-        (quiz_id, user_id, q_index),
-    ).fetchone()
-
-    if not exists:
-        conn.execute(
-            """ INSERT INTO answers (quiz_id,user_id,q_index,selected,correct,answered_at) VALUES (?,?,?,?,?,?) """,
-            (
-                quiz_id,
-                user_id,
-                q_index,
-                selected,
-                correct,
-                now_local().isoformat(),
-            ),
+        existing = session.scalar(
+            select(PollAnswer)
+            .where(PollAnswer.poll_id == answer.poll_id, PollAnswer.user_id == user.id)
+            .limit(1)
         )
-        conn.execute(
-            """ UPDATE attempts SET current_index=current_index+1 WHERE quiz_id=? AND user_id=? AND current_index=? """,
-            (quiz_id, user_id, q_index),
+        if existing:
+            # Safety fallback if Telegram still sends an update after a client-side
+            # retry. Keep first answer to preserve exam semantics.
+            return
+
+        session.add(
+            PollAnswer(
+                poll_id=answer.poll_id,
+                run_id=poll_row.run_id,
+                user_id=user.id,
+                user_name=user_name,
+                selected_index=selected_index,
+                is_correct=is_correct,
+                answered_at=now,
+            )
         )
-        conn.commit()
-
-    conn.close()
-    await send_next_question(context, quiz_id, user_id)
+        session.commit()
 
 
-# ---------------------------------------------------------------------------
-# Results / leaderboard
-# ---------------------------------------------------------------------------
+def build_leaderboard(run_id: str) -> str:
+    """Build the final leaderboard for a completed quiz run.
 
-def get_leaderboard(quiz_id: str) -> list[dict]:
-    conn = db()
-    attempts = conn.execute(
-        """ SELECT * FROM attempts WHERE quiz_id=? AND completed=1 """,
-        (quiz_id,),
-    ).fetchall()
+    Participant rule:
+      - Only students who attempted at least one question are listed.
+      - If more than 50 students attempted, only the first 50 sorted by correct
+        answers are shown.
 
-    rows = []
-    quizrow = conn.execute(
-        "SELECT questions_json FROM quizzes WHERE id=?", (quiz_id,)
-    ).fetchone()
-    total = len(json.loads(quizrow["questions_json"])) if quizrow else 0
+    Ranking rule requested by ECA:
+      - Rank is based on number of correct answers.
+      - Students with the same number of correct answers receive the same rank.
+      - Raw marks are displayed separately as Correct - Wrong/3.
+    """
+    with SessionLocal() as session:
+        run = session.get(QuizRun, run_id)
+        if not run:
+            return "Quiz run not found."
+        quiz = session.get(Quiz, run.quiz_id)
+        if not quiz:
+            return "Quiz not found."
 
-    for a in attempts:
-        stats = conn.execute(
-            """ SELECT SUM(CASE WHEN correct=1 THEN 1 ELSE 0 END) AS right_count, SUM(CASE WHEN selected IS NOT NULL AND correct=0 THEN 1 ELSE 0 END) AS wrong_count, SUM(CASE WHEN selected IS NULL THEN 1 ELSE 0 END) AS unattempted FROM answers WHERE quiz_id=? AND user_id=? """,
-            (quiz_id, a["user_id"]),
-        ).fetchone()
-        right = int(stats["right_count"] or 0)
-        wrong = int(stats["wrong_count"] or 0)
-        unattempted = int(stats["unattempted"] or 0)
+        answers = session.scalars(
+            select(PollAnswer).where(PollAnswer.run_id == run_id)
+        ).all()
+
+    participant_map: dict[int, dict[str, Any]] = {}
+    for ans in answers:
+        item = participant_map.setdefault(
+            ans.user_id,
+            {"name": ans.user_name, "correct": 0, "wrong": 0},
+        )
+        item["name"] = ans.user_name
+        if ans.is_correct:
+            item["correct"] += 1
+        else:
+            item["wrong"] += 1
+
+    rows: list[dict[str, Any]] = []
+    total_questions = int(quiz.question_count)
+    for user_id, item in participant_map.items():
+        correct = int(item["correct"])
+        wrong = int(item["wrong"])
+        answered = correct + wrong
+        unattempted = max(0, total_questions - answered)
+        raw_marks = correct - (wrong / 3.0)
         rows.append(
             {
-                "user_id": a["user_id"],
-                "username": a["username"],
-                "display_name": a["display_name"],
-                "right": right,
+                "user_id": user_id,
+                "name": repair_mojibake(item["name"]),
+                "correct": correct,
                 "wrong": wrong,
                 "unattempted": unattempted,
-                "raw": raw_marks(right, wrong, total),
+                "raw_marks": raw_marks,
             }
         )
-    conn.close()
 
-    # Requested ranking rule: equal number correct = same rank.
-    rows.sort(key=lambda x: (-x["right"], x["raw"], x["display_name"].casefold()))
-    for i in range(len(rows)):
-        rows[i]["rank"] = rank_from_rows(rows, i)
+    # Primary order is correct answers; raw marks is a deterministic tie-breaker
+    # within the same correct-answer count, but rank remains identical.
+    rows.sort(
+        key=lambda x: (-x["correct"], -x["raw_marks"], x["name"].lower(), x["user_id"])
+    )
 
-    # Show all if <=50; otherwise top 50.
-    return rows if len(rows) <= 50 else rows[:50]
+    previous_correct: Optional[int] = None
+    rank = 0
+    for index, row in enumerate(rows, start=1):
+        correct_key = int(row["correct"])
+        if previous_correct is None or correct_key != previous_correct:
+            rank = index
+        row["rank"] = rank
+        previous_correct = correct_key
 
-
-def format_leaderboard(quiz: dict, rows: list[dict]) -> str:
     lines = [
-        "ECA LIVE QUIZ - LEADERBOARD",
-        f"Quiz: {clean_ui_text(quiz['title'])}",
+        "ðŸ† ECA LIVE QUIZ â€” LEADERBOARD",
+        "",
+        f"Quiz: {repair_mojibake(quiz.title)}",
         "",
     ]
-    for r in rows:
-        name = clean_ui_text(r["display_name"])
-        identity = f"{name} [{r['user_id']}]"
-        lines.append(
-            f"{identity} "
-            f"✅{r['right']} ❌{r['wrong']} ⭕{r['unattempted']} "
-            f"[Raw marks - {r['raw']:.2f}] {r['rank']}"
-        )
+
     if not rows:
-        lines.append("No completed attempts yet.")
+        lines.append("No student attempted any question.")
+        return "\n".join(lines)
+
+    for row in rows[:50]:
+        # Requested compact format: âœ…right âŒwrong â­•unattempted [Raw marksâ€”X] rank
+        raw = row["raw_marks"]
+        raw_text = f"{raw:.2f}".rstrip("0").rstrip(".")
+        lines.append(
+            f"{row['name'][:45]} ({row['user_id']}) â€” "
+            f"âœ…{row['correct']} âŒ{row['wrong']} â­•{row['unattempted']} "
+            f"[Raw marksâ€”{raw_text}] {row['rank']}"
+        )
+
     return "\n".join(lines)
 
 
-async def complete_attempt(context: ContextTypes.DEFAULT_TYPE, quiz: dict, user_id: int):
-    conn = db()
-    conn.execute(
-        """ UPDATE attempts SET completed=1, completed_at=? WHERE quiz_id=? AND user_id=? """,
-        (now_local().isoformat(), quiz["id"], user_id),
-    )
-    conn.commit()
-    conn.close()
-
-    rows = get_leaderboard(quiz["id"])
-    leaderboard = format_leaderboard(quiz, rows)
-
-    pdf_path = await asyncio.to_thread(build_quiz_pdf, quiz)
-
-    await context.bot.send_message(
-        chat_id=user_id,
-        text="QUIZ COMPLETED\n\n" + leaderboard,
-    )
-    await context.bot.send_document(
-        chat_id=user_id,
-        document=pdf_path.open("rb"),
-        caption=(
-            "Complete Quiz PDF\n"
-            f"Test No. {quiz['test_no']} | {quiz['quiz_date']} | {quiz['quiz_time']}\n"
-            "ETERNAL CIVIL ACADEMY"
-        ),
-    )
+async def safe_send_message(bot: Any, chat_id: int, text: str) -> None:
+    try:
+        text = repair_mojibake(text)
+        await bot.send_message(chat_id=chat_id, text=text[:4096])
+    except Exception:
+        logger.exception("Could not send message to chat=%s", chat_id)
 
 
-# ---------------------------------------------------------------------------
-# Publishing
-# ---------------------------------------------------------------------------
+# ============================================================
+# Recovery after Render restart
+# ============================================================
 
-async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /publish QUIZ_ID")
-        return
+async def recover_active_runs(application: Application) -> None:
+    """Recover persisted active runs after a process restart.
 
-    chat_id = os.getenv("QUIZ_CHAT_ID", "").strip()
-    if not chat_id:
-        await update.message.reply_text(
-            "QUIZ_CHAT_ID is not configured. The prepared quiz link can still be used personally."
+    We use the DB as the source of truth. If the last poll's scheduled job was
+    lost during restart, schedule the next poll from the stored closes_at.
+    """
+    with SessionLocal() as session:
+        active_runs = session.scalars(
+            select(QuizRun).where(QuizRun.active == True)  # noqa: E712
+        ).all()
+
+    now = datetime.now(timezone.utc)
+    recovered = 0
+    for run in active_runs:
+        with SessionLocal() as session:
+            last_poll = session.scalar(
+                select(QuizPoll)
+                .where(QuizPoll.run_id == run.id)
+                .order_by(QuizPoll.question_no.desc())
+                .limit(1)
+            )
+
+        if not last_poll:
+            delay = 0.5
+        else:
+            delay = max(0.5, (last_poll.closes_at - now).total_seconds())
+
+        application.job_queue.run_once(
+            send_next_question_job,
+            when=delay,
+            data={"run_id": run.id},
+            name=f"eca-recover-{run.id}",
         )
-        return
+        recovered += 1
+    logger.info("Recovered %s active quiz runs after startup.", recovered)
 
-    quiz_id = context.args[0]
-    conn = db()
-    row = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-    conn.close()
-    if not row:
-        await update.message.reply_text("Quiz ID not found.")
-        return
 
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start=quiz_{quiz_id}"
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"ETERNAL CIVIL ACADEMY\n\n"
-            f"Quiz: {clean_ui_text(row['title'])}\n"
-            f"Questions: {len(json.loads(row['questions_json']))}\n\n"
-            f"Attempt Quiz:\n{link}"
-        ),
-        disable_web_page_preview=True,
+# ============================================================
+# Cancel/help/error/startup
+# ============================================================
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    for path in list(context.user_data.get("source_files", [])):
+        cleanup_file(path)
+    # Backward-compatible cleanup if an old state left a single source_file.
+    cleanup_file(context.user_data.get("source_file"))
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "âŒ Operation cancelled.",
+        reply_markup=ReplyKeyboardRemove(),
     )
-    await update.message.reply_text("Quiz link published.")
+    return ConversationHandler.END
 
 
-# ---------------------------------------------------------------------------
-# Error handler
-# ---------------------------------------------------------------------------
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "ðŸ“š ECA QUIZ MAKER\n\n"
+        "/start â€” Quiz Maker\n"
+        "/cancel â€” Cancel current operation\n"
+        "/whoami â€” Show Telegram User ID\n\n"
+        "OWNER COMMANDS\n"
+        "/addadmin â€” reply to a user message\n"
+        "/removeadmin â€” reply to an admin message\n"
+        "/admins â€” Show admin list\n\n"
+        "MAIN MODES\n"
+        "ðŸ¤– AI Generate Questions\n"
+        "ðŸ“š I Will Provide Source"
+    )
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled bot error", exc_info=context.error)
+
+async def post_init(application: Application) -> None:
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        logger.exception("delete_webhook failed.")
+    me = await application.bot.get_me()
+    logger.info("Started as @%s", me.username)
+    await recover_active_runs(application)
 
 
-# ---------------------------------------------------------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+
+
+# ============================================================
 # Main
-# ---------------------------------------------------------------------------
+# ============================================================
 
-def main():
+
+def main() -> None:
+    # Start the Render HTTP listener first so the Web Service port is available
+    # immediately, even if database initialization takes a little time.
+    threading.Thread(
+        target=start_health_server,
+        name="eca-health-server",
+        daemon=True,
+    ).start()
+
     init_db()
-    register_pdf_fonts()
 
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not configured.")
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-    if not ADMIN_IDS:
-        raise RuntimeError("ADMIN_IDS is not configured.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("newquiz", newquiz_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("publish", publish_cmd))
-
-    # Deep-link start is handled before ordinary start behavior by inspecting args.
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_admin_document,
-        )
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_admin_text,
-        )
-    )
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
-    app.add_error_handler(error_handler)
 
-    log.info("ECA Quiz Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    conversation = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            STATE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_mode)],
+            STATE_SOURCE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_source_type)],
+            STATE_SOURCE_CONTENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_source_text),
+                MessageHandler(filters.PHOTO | filters.Document.ALL | filters.POLL, receive_source_file),
+            ],
+            STATE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_topic)],
+            STATE_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_count)],
+            STATE_LANGUAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_language)],
+            STATE_START_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_start_location)],
+            STATE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_question_time)],
+            STATE_GROUP_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_group_start_time)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    application.add_handler(conversation)
+    application.add_handler(CommandHandler("addadmin", add_admin))
+    application.add_handler(CommandHandler("removeadmin", remove_admin))
+    application.add_handler(CommandHandler("admins", list_admins))
+    application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(PollAnswerHandler(poll_answer_handler))
+    application.add_error_handler(error_handler)
+
+    logger.info("ECA Quiz Maker Bot is running...")
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
