@@ -1,59 +1,47 @@
-# ECA Quiz Maker Bot
+# ECA Quiz Maker Bot â€” Final
 
-Production-oriented Telegram quiz maker for Eternal Civil Academy.
+Production-oriented Telegram quiz bot for Eternal Civil Academy.
 
-## Final flow
-
-1. `/start`
-2. Choose:
-   - ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡
-   - ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾
-3. AI mode: AI finds authoritative sources and verifies facts.
-4. Source mode accepts PDF, photo, text, Telegram poll, or URL.
-5. Choose topic, question count, and language:
-   - à¤¹à¤¿à¤‚à¤¦à¥€
-   - English
-   - Bilingual
-6. Bot generates and validates the questions but **does not publish them all at once**.
-7. Bot shows a quiz-ready summary and link.
-8. Choose:
-   - ðŸ‘¤ Personally
-   - ðŸ‘¥ Group
-9. Choose time per question:
-   - 15 à¤¸à¥‡à¤•à¤‚à¤¡
-   - 25 à¤¸à¥‡à¤•à¤‚à¤¡
-   - 30 à¤¸à¥‡à¤•à¤‚à¤¡
-   - 1 à¤®à¤¿à¤¨à¤Ÿ
-10. The bot sends exactly one Telegram quiz poll at a time. When its timer ends, the next question is sent automatically.
-11. At completion, the bot sends the result/leaderboard.
-
-## Environment variables
+## Required Render Environment Variables
 
 - `BOT_TOKEN`
 - `OWNER_USER_ID`
 - `GEMINI_API_KEY`
-- `GEMINI_MODEL` (optional)
-- `GEMINI_FALLBACK_MODELS` (optional)
-- `DATABASE_URL` (optional; SQLite default)
-- `PORT` (optional; Render default is usually supplied)
 
-## Render
+Recommended for quota failover:
+- `GEMINI_API_KEYS` â€” comma-separated Gemini keys that are actually usable under separate quotas/projects.
+- `DATABASE_URL` â€” a persistent PostgreSQL connection string on Render/another persistent DB provider.
 
-Build command:
-```text
-pip install -r requirements.txt
-```
+Optional:
+- `GEMINI_MODEL` (default `gemini-3.8-flash`)
+- `GEMINI_FALLBACK_MODELS` (default `gemini-3.1-flash-lite,gemini-3.5-flash`)
+- `PORT` (Render supplies this automatically)
 
-Start command:
+## Render Start Command
+
 ```text
 python bot.py
 ```
 
-## Admin
+No `main.py` is required.
 
-Owner can authorize another Telegram user without putting IDs into source code:
+## Important
 
-- Reply to the user's message with `/addadmin`
-- `/removeadmin` by replying to an admin message
-- `/admins`
-- `/whoami`
+A Gemini `429 RESOURCE_EXHAUSTED` error is a provider quota/rate-limit problem. A different model in the same exhausted project does not create new quota. This version avoids repeated retries, supports multiple configured keys, and never fabricates questions to hide a quota failure.
+
+For persistent Render data, set `DATABASE_URL` to PostgreSQL. SQLite is kept as a local/testing fallback.
+
+## Final quiz workflow
+
+Main menu has exactly two options:
+
+1. `ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡`
+2. `ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾`
+
+AI mode: Topic -> Count -> Language -> AI search/verification -> prepared quiz.
+
+Source mode: PDF / Photo / Text / Telegram Poll / URL -> Topic -> Count -> Language -> prepared quiz.
+
+After preparation, questions are not dumped as a batch. The admin chooses Personal or Group, chooses 15 sec / 25 sec / 30 sec / 1 min per question, and the bot sends one native Telegram quiz poll at a time.
+
+Group deep-link flow asks the timer inside the target group before the first poll.
