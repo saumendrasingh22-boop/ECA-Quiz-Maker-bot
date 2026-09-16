@@ -1,2018 +1,2131 @@
 import os
 import re
 import json
-import hashlib
+import uuid
 import sqlite3
-import logging
 import threading
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import logging
+import tempfile
+from dataclasses import dataclass
+from typing import List, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
+
 from google import genai
 from google.genai import types
 
 
-# =========================================================
+# ============================================================
 # ECA QUIZ MAKER BOT
-# Eternal Civil Academy
-# =========================================================
+# ============================================================
+#
+# FEATURES
+# ------------------------------------------------------------
+# OWNER
+#   /addadmin  -> reply to a user's message
+#   /removeadmin -> reply to a user's message
+#   /admins
+#   /whoami
+#
+# ADMIN
+#   AI Automatic Quiz
+#       -> My Source
+#           -> Photo / PDF / Text
+#       -> AI Find Source
+#
+# AI
+#   Gemini API
+#   Google Search grounding
+#   Original MCQs
+#   Duplicate prevention
+#   ECA question history
+#   Source verification instructions
+#
+# RENDER
+#   Health server on 0.0.0.0:$PORT
+#
+# ============================================================
+
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or 0)
-
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().lstrip("-").isdigit()
-}
-
-if OWNER_ID:
-    ADMIN_IDS.add(OWNER_ID)
+OWNER_USER_ID = int(
+    os.getenv("OWNER_USER_ID", "0").strip() or "0"
+)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-MODEL = os.getenv(
+# You can change this later from Render Environment Variables.
+GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.8-flash"
 ).strip()
 
-DB_PATH = os.getenv(
-    "DB_PATH",
-    "eca_quiz.db"
+PORT = int(
+    os.getenv("PORT", "10000").strip() or "10000"
 )
 
-MAX_QUESTIONS = 20
+DB_FILE = os.getenv(
+    "ECA_DB_FILE",
+    "eca_quiz.db"
+).strip()
 
-SOURCE_LINE = "Source: @EternalCivilAcademy"
 
-
-# =========================================================
+# ============================================================
 # LOGGING
-# =========================================================
+# ============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-log = logging.getLogger("eca-quiz")
+logger = logging.getLogger("ECA-Quiz-Maker")
 
 
-# =========================================================
-# ENVIRONMENT CHECK
-# =========================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-
-if not OWNER_ID:
-    raise RuntimeError("OWNER_ID is missing")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing")
-
-
-# =========================================================
+# ============================================================
 # GEMINI CLIENT
-# =========================================================
+# ============================================================
 
-ai = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+gemini_client = None
 
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-def get_db():
-
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            q_hash TEXT UNIQUE,
-            question TEXT NOT NULL,
-            topic TEXT,
-            source TEXT,
-            created_by INTEGER,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.commit()
-
-    return conn
-
-
-get_db().close()
-
-
-# =========================================================
-# ADMIN AUTHENTICATION
-# =========================================================
-
-def is_authorized(user_id: int) -> bool:
-
-    if user_id == OWNER_ID:
-        return True
-
-    if user_id in ADMIN_IDS:
-        return True
-
-    conn = get_db()
-
-    row = conn.execute(
-        "SELECT 1 FROM admins WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
-
-    conn.close()
-
-    return bool(row)
-
-
-def add_admin(user_id: int, added_by: int):
-
-    conn = get_db()
-
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO admins(user_id, added_by)
-        VALUES (?, ?)
-        """,
-        (user_id, added_by)
-    )
-
-    conn.commit()
-    conn.close()
-
-    ADMIN_IDS.add(user_id)
-
-
-def remove_admin(user_id: int):
-
-    if user_id == OWNER_ID:
-        return False
-
-    conn = get_db()
-
-    conn.execute(
-        "DELETE FROM admins WHERE user_id=?",
-        (user_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    ADMIN_IDS.discard(user_id)
-
-    return True
-
-
-# =========================================================
-# QUESTION DUPLICATE SYSTEM
-# =========================================================
-
-def normalize(text: str) -> str:
-
-    text = text.lower().strip()
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"[^\w\s\u0900-\u097f]",
-        "",
-        text
-    )
-
-    return text
-
-
-def question_hash(question: str):
-
-    return hashlib.sha256(
-        normalize(question).encode("utf-8")
-    ).hexdigest()
-
-
-def get_previous_questions(limit=500):
-
-    conn = get_db()
-
-    rows = conn.execute(
-        """
-        SELECT question, topic
-        FROM questions
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (limit,)
-    ).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def save_question(
-    question_data,
-    user_id,
-    source
-):
-
-    q_hash = question_hash(
-        question_data["question"]
-    )
-
-    conn = get_db()
-
+if GEMINI_API_KEY:
     try:
-
-        conn.execute(
-            """
-            INSERT INTO questions
-            (
-                q_hash,
-                question,
-                topic,
-                source,
-                created_by
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                q_hash,
-                question_data["question"],
-                question_data.get("topic", ""),
-                source,
-                user_id,
-            )
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY
         )
-
-        conn.commit()
-
-        success = True
-
-    except sqlite3.IntegrityError:
-
-        success = False
-
-    conn.close()
-
-    return success
-
-
-# =========================================================
-# TELEGRAM MENUS
-# =========================================================
-
-def main_menu():
-
-    return InlineKeyboardMarkup(
-        [
-
-            [
-                InlineKeyboardButton(
-                    "Automatic",
-                    callback_data="mode_auto"
-                ),
-
-                InlineKeyboardButton(
-                    "Manual",
-                    callback_data="mode_manual"
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "AI खुद Source खोजे",
-                    callback_data="auto_search"
-                ),
-
-                InlineKeyboardButton(
-                    "Source भेजें",
-                    callback_data="auto_source"
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "Book/Page Photo OCR",
-                    callback_data="ocr"
-                )
-            ],
-
-        ]
-    )
-
-
-def language_menu():
-
-    return InlineKeyboardMarkup(
-        [
-
-            [
-                InlineKeyboardButton(
-                    "हिंदी",
-                    callback_data="lang_hi"
-                ),
-
-                InlineKeyboardButton(
-                    "English",
-                    callback_data="lang_en"
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "Bilingual",
-                    callback_data="lang_bi"
-                )
-            ],
-
-        ]
-    )
-
-
-# =========================================================
-# BASIC HELP
-# =========================================================
-
-async def deny(update: Update):
-
-    await update.effective_message.reply_text(
-        "यह सुविधा केवल Owner और authorized Admins के लिए है।"
-    )
-
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data.clear()
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        await update.effective_message.reply_text(
-            "ECA Quiz Maker में आपका स्वागत है।\n\n"
-            "Quiz generation केवल Owner/authorized Admins के लिए उपलब्ध है।"
-        )
-
-        return
-
-    await update.effective_message.reply_text(
-        "ECA Quiz Maker\n\n"
-        "Mode चुनें:",
-        reply_markup=main_menu()
-    )
-
-
-async def cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data.clear()
-
-    await update.effective_message.reply_text(
-        "Current operation cancelled."
-    )
-
-
-# =========================================================
-# ADMIN COMMANDS
-# =========================================================
-
-async def addadmin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_user.id != OWNER_ID:
-
-        await deny(update)
-
-        return
-
-    if (
-        not context.args
-        or not context.args[0].lstrip("-").isdigit()
-    ):
-
-        await update.effective_message.reply_text(
-            "Use:\n/addadmin NUMERIC_USER_ID"
-        )
-
-        return
-
-    user_id = int(
-        context.args[0]
-    )
-
-    add_admin(
-        user_id,
-        update.effective_user.id
-    )
-
-    await update.effective_message.reply_text(
-        f"Admin authorized successfully.\n\nID: {user_id}"
-    )
-
-
-async def deladmin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_user.id != OWNER_ID:
-
-        await deny(update)
-
-        return
-
-    if (
-        not context.args
-        or not context.args[0].lstrip("-").isdigit()
-    ):
-
-        await update.effective_message.reply_text(
-            "Use:\n/deladmin NUMERIC_USER_ID"
-        )
-
-        return
-
-    user_id = int(
-        context.args[0]
-    )
-
-    if remove_admin(user_id):
-
-        await update.effective_message.reply_text(
-            f"Admin removed successfully.\n\nID: {user_id}"
-        )
-
-    else:
-
-        await update.effective_message.reply_text(
-            "Owner को remove नहीं किया जा सकता।"
-        )
-
-
-async def admins(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_user.id != OWNER_ID:
-
-        await deny(update)
-
-        return
-
-    conn = get_db()
-
-    rows = conn.execute(
-        "SELECT user_id FROM admins ORDER BY user_id"
-    ).fetchall()
-
-    conn.close()
-
-    ids = sorted(
-        set(
-            [OWNER_ID]
-            +
-            [row[0] for row in rows]
-        )
-    )
-
-    text = "Authorized Admin IDs:\n\n"
-
-    text += "\n".join(
-        str(x)
-        for x in ids
-    )
-
-    await update.effective_message.reply_text(
-        text
-    )
-
-
-# =========================================================
-# MODE COMMANDS
-# =========================================================
-
-async def manual_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        await deny(update)
-
-        return
-
-    context.user_data.clear()
-
-    context.user_data["mode"] = "manual"
-
-    await update.effective_message.reply_text(
-        "Manual Quiz Mode\n\n"
-
-        "अपने questions इस format में भेजें:\n\n"
-
-        "Q: Question\n"
-        "A: Option 1\n"
-        "B: Option 2\n"
-        "C: Option 3\n"
-        "D: Option 4\n"
-        "ANS: A\n"
-        "EXP: Explanation\n\n"
-
-        "एक से अधिक questions भी भेज सकते हैं।"
-    )
-
-
-async def auto_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        await deny(update)
-
-        return
-
-    await update.effective_message.reply_text(
-        "Automatic Mode:",
-        reply_markup=InlineKeyboardMarkup(
-            [
-
-                [
-                    InlineKeyboardButton(
-                        "Source भेजें",
-                        callback_data="auto_source"
-                    )
-                ],
-
-                [
-                    InlineKeyboardButton(
-                        "AI खुद Source खोजे",
-                        callback_data="auto_search"
-                    )
-                ],
-
-                [
-                    InlineKeyboardButton(
-                        "Book/Page Photo OCR",
-                        callback_data="ocr"
-                    )
-                ],
-
-            ]
-        )
-    )
-
-
-async def source_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        await deny(update)
-
-        return
-
-    context.user_data.clear()
-
-    context.user_data["mode"] = "source"
-
-    await update.effective_message.reply_text(
-        "अब source भेजें:\n\n"
-        "• Text\n"
-        "• PDF\n"
-        "• Document\n"
-        "• Book/Page Photo"
-    )
-
-
-async def search_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        await deny(update)
-
-        return
-
-    context.user_data.clear()
-
-    context.user_data["mode"] = "search"
-
-    await update.effective_message.reply_text(
-        "Topic भेजें।\n\n"
-        "AI reliable/official sources खोजकर "
-        "उस topic पर original questions बनाएगा।"
-    )
-
-
-async def ocr_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        await deny(update)
-
-        return
-
-    context.user_data.clear()
-
-    context.user_data["mode"] = "ocr"
-
-    await update.effective_message.reply_text(
-        "अब book/page की clear photo भेजें।"
-    )
-
-
-# =========================================================
-# AI PROMPT
-# =========================================================
-
-QUESTION_SCHEMA = {
-
-    "type": "object",
-
-    "properties": {
-
-        "questions": {
-
-            "type": "array",
-
-            "items": {
-
-                "type": "object",
-
-                "properties": {
-
-                    "question": {
-                        "type": "string"
-                    },
-
-                    "options": {
-
-                        "type": "array",
-
-                        "items": {
-                            "type": "string"
-                        }
-
-                    },
-
-                    "correct_index": {
-                        "type": "integer"
-                    },
-
-                    "explanation": {
-                        "type": "string"
-                    },
-
-                    "topic": {
-                        "type": "string"
-                    },
-
-                },
-
-                "required": [
-                    "question",
-                    "options",
-                    "correct_index",
-                    "explanation",
-                    "topic"
-                ],
-
-            }
-        }
-
-    },
-
-    "required": [
-        "questions"
-    ],
-}
-
-
-def create_prompt(
-    content,
-    language,
-    count,
-    mode
-):
-
-    previous = get_previous_questions()
-
-    previous_text = "\n".join(
-        f"- {question} [topic: {topic}]"
-        for question, topic
-        in previous[:250]
-    )
-
-    if not previous_text:
-
-        previous_text = (
-            "(No previous ECA questions available.)"
-        )
-
-    language_rule = {
-
-        "hi":
-        "Question, options और explanation स्पष्ट Hindi में लिखो.",
-
-        "en":
-        "Write question, options and explanation in clear English.",
-
-        "bi":
-        "Question और options Hindi + English bilingual format में लिखो. "
-        "Explanation concise रखो.",
-
-    }[language]
-
-    if mode == "search":
-
-        source_rule = """
-
-Use Google Search grounding.
-
-Prefer:
-• Government websites
-• Official reports
-• Constitutional/legal texts
-• Parliament/Ministry sources
-• RBI/SEBI/UPSC/ECI/UN/World Bank etc. official sources
-• Other authoritative primary sources
-
-Do not invent facts.
-
-If information cannot be verified confidently,
-DO NOT create a question from it.
-"""
-
-    else:
-
-        source_rule = """
-
-Use only the supplied source/content.
-
-Do not introduce unrelated facts.
-
-Do not invent missing information.
-"""
-
-    return f"""
-
-You are the senior question setter for
-ETERNAL CIVIL ACADEMY (ECA).
-
-Generate up to {count} ORIGINAL competitive-exam MCQs.
-
-LANGUAGE:
-{language_rule}
-
-STRICT ECA QUESTION RULES:
-
-1. Every question must be ORIGINAL.
-
-2. Never copy an existing question from the source.
-
-3. Never create a duplicate merely by changing wording.
-
-4. Avoid questions substantially similar to previous ECA questions.
-
-5. From ONE narrow topic/concept,
-   maximum 1-2 questions.
-
-6. Prefer different:
-   • subtopics
-   • concepts
-   • dimensions
-   • analytical angles
-
-7. Exactly 4 options.
-
-8. Exactly ONE correct option.
-
-9. Reject ambiguous questions.
-
-10. Reject doubtful or poorly supported facts.
-
-11. Do not create trivia merely to reach the requested count.
-
-12. UPSC/PCS/State PCS level quality should be preferred.
-
-13. The explanation must:
-   • first explain why the correct answer is correct
-   • then briefly tell what the other three options represent
-     or why they are incorrect
-
-14. Explanation MUST remain within 200 characters.
-
-15. Do not mention these internal rules.
-
-16. Return ONLY valid JSON.
-
-{source_rule}
-
-PREVIOUS ECA QUESTIONS
-which MUST be avoided:
-
-{previous_text}
-
-SOURCE / TOPIC:
-
-{content[:50000]}
-"""
-
-
-# =========================================================
-# AI GENERATION
-# =========================================================
-
-async def generate_questions(
-    content,
-    language,
-    count,
-    mode
-):
-
-    prompt = create_prompt(
-        content,
-        language,
-        min(count, MAX_QUESTIONS),
-        mode
-    )
-
-    config = types.GenerateContentConfig(
-
-        response_mime_type="application/json",
-
-        response_schema=QUESTION_SCHEMA,
-
-        temperature=0.7,
-    )
-
-    if mode == "search":
-
-        config.tools = [
-            types.Tool(
-                google_search=types.GoogleSearch()
-            )
-        ]
-
-    response = ai.models.generate_content(
-
-        model=MODEL,
-
-        contents=prompt,
-
-        config=config,
-    )
-
-    data = json.loads(
-        response.text
-    )
-
-    return data.get(
-        "questions",
-        []
-    )
-
-
-# =========================================================
-# QUESTION VALIDATION
-# =========================================================
-
-def validate_question(question_data):
-
-    question = str(
-        question_data.get(
-            "question",
-            ""
-        )
-    ).strip()
-
-    options = [
-        str(x).strip()
-        for x in question_data.get(
-            "options",
-            []
-        )
-    ]
-
-    correct_index = question_data.get(
-        "correct_index"
-    )
-
-    explanation = str(
-        question_data.get(
-            "explanation",
-            ""
-        )
-    ).strip()
-
-    topic = str(
-        question_data.get(
-            "topic",
-            ""
-        )
-    ).strip()
-
-    if not question:
-        return None
-
-    if len(question) > 300:
-        return None
-
-    if len(options) != 4:
-        return None
-
-    if any(
-        not option
-        or len(option) > 100
-        for option in options
-    ):
-
-        return None
-
-    normalized_options = [
-        normalize(option)
-        for option in options
-    ]
-
-    if len(set(normalized_options)) != 4:
-        return None
-
-    if (
-        not isinstance(correct_index, int)
-        or correct_index < 0
-        or correct_index > 3
-    ):
-
-        return None
-
-    if not explanation:
-        return None
-
-    question_data["question"] = question
-
-    question_data["options"] = options
-
-    question_data["correct_index"] = correct_index
-
-    question_data["explanation"] = explanation[:200]
-
-    question_data["topic"] = (
-        topic
-        if topic
-        else "General"
-    )
-
-    return question_data
-
-
-# =========================================================
-# PUBLISH QUIZZES
-# =========================================================
-
-async def publish_questions(
-    update,
-    questions,
-    source
-):
-
-    published = 0
-
-    topic_counter = {}
-
-    for raw_question in questions:
-
-        question = validate_question(
-            raw_question
-        )
-
-        if not question:
-            continue
-
-        topic_key = normalize(
-            question["topic"]
-        )
-
-        topic_counter[topic_key] = (
-            topic_counter.get(
-                topic_key,
-                0
-            ) + 1
-        )
-
-        # Maximum 2 questions from one narrow topic
-        if topic_counter[topic_key] > 2:
-            continue
-
-        # Exact duplicate protection
-        if not save_question(
-            question,
-            update.effective_user.id,
-            source
-        ):
-
-            continue
-
-        try:
-
-            await update.effective_chat.send_poll(
-
-                question=question["question"],
-
-                options=question["options"],
-
-                type="quiz",
-
-                correct_option_ids=[
-                    question["correct_index"]
-                ],
-
-                is_anonymous=False,
-
-                explanation=question["explanation"],
-
-                description=SOURCE_LINE,
-
-            )
-
-            published += 1
-
-        except Exception as error:
-
-            log.exception(
-                "send_poll failed: %s",
-                error
-            )
-
-    await update.effective_message.reply_text(
-
-        "ECA Quiz generation complete.\n\n"
-
-        f"Published: {published}\n\n"
-
-        f"{SOURCE_LINE}"
-    )
-
-
-# =========================================================
-# MANUAL QUESTION PARSER
-# =========================================================
-
-def parse_manual_questions(text):
-
-    blocks = re.split(
-        r"\n\s*\n+",
-        text.strip()
-    )
-
-    result = []
-
-    for block in blocks:
-
-        q = re.search(
-            r"(?im)^Q:\s*(.+)$",
-            block
-        )
-
-        options = re.findall(
-            r"(?im)^[A-D]:\s*(.+)$",
-            block
-        )
-
-        answer = re.search(
-            r"(?im)^ANS:\s*([A-D])\s*$",
-            block
-        )
-
-        explanation = re.search(
-            r"(?im)^EXP:\s*(.+)$",
-            block
-        )
-
-        if (
-            not q
-            or len(options) != 4
-            or not answer
-        ):
-
-            continue
-
-        result.append({
-
-            "question":
-                q.group(1).strip(),
-
-            "options":
-                [
-                    option.strip()
-                    for option in options
-                ],
-
-            "correct_index":
-                ord(
-                    answer.group(1).upper()
-                ) - 65,
-
-            "explanation":
-                (
-                    explanation.group(1).strip()
-                    if explanation
-                    else
-                    "Answer supplied by ECA Admin."
-                ),
-
-            "topic":
-                "Manual",
-
-        })
-
-    return result
-
-
-# =========================================================
-# CALLBACKS
-# =========================================================
-
-async def callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_authorized(
-        query.from_user.id
-    ):
-
-        await query.edit_message_text(
-            "यह सुविधा केवल Owner/authorized Admins के लिए है।"
-        )
-
-        return
-
-    data = query.data
-
-
-    # -------------------------
-    # AUTOMATIC
-    # -------------------------
-
-    if data == "mode_auto":
-
-        await query.edit_message_text(
-
-            "Automatic Mode चुनें:",
-
-            reply_markup=InlineKeyboardMarkup(
-
-                [
-
-                    [
-                        InlineKeyboardButton(
-                            "Source भेजें",
-                            callback_data="auto_source"
-                        )
-                    ],
-
-                    [
-                        InlineKeyboardButton(
-                            "AI खुद Source खोजे",
-                            callback_data="auto_search"
-                        )
-                    ],
-
-                    [
-                        InlineKeyboardButton(
-                            "Book/Page Photo OCR",
-                            callback_data="ocr"
-                        )
-                    ],
-
-                ]
-            )
-        )
-
-        return
-
-
-    # -------------------------
-    # MANUAL
-    # -------------------------
-
-    if data == "mode_manual":
-
-        context.user_data.clear()
-
-        context.user_data["mode"] = "manual"
-
-        await query.edit_message_text(
-
-            "Manual Quiz Mode\n\n"
-
-            "Format:\n\n"
-
-            "Q: Question\n"
-            "A: Option 1\n"
-            "B: Option 2\n"
-            "C: Option 3\n"
-            "D: Option 4\n"
-            "ANS: A\n"
-            "EXP: Explanation"
-        )
-
-        return
-
-
-    # -------------------------
-    # SOURCE
-    # -------------------------
-
-    if data == "auto_source":
-
-        context.user_data.clear()
-
-        context.user_data["mode"] = "source"
-
-        await query.edit_message_text(
-
-            "अब source भेजें:\n\n"
-            "Text / PDF / Document / Photo"
-        )
-
-        return
-
-
-    # -------------------------
-    # AI SEARCH
-    # -------------------------
-
-    if data == "auto_search":
-
-        context.user_data.clear()
-
-        context.user_data["mode"] = "search"
-
-        await query.edit_message_text(
-
-            "जिस topic पर AI reliable sources "
-            "खोजे, वह topic भेजें।"
-        )
-
-        return
-
-
-    # -------------------------
-    # OCR
-    # -------------------------
-
-    if data == "ocr":
-
-        context.user_data.clear()
-
-        context.user_data["mode"] = "ocr"
-
-        await query.edit_message_text(
-
-            "अब book/page की clear photo भेजें।"
-        )
-
-        return
-
-
-    # -------------------------
-    # LANGUAGE
-    # -------------------------
-
-    if data.startswith("lang_"):
-
-        language = data.split(
-            "_",
-            1
-        )[1]
-
-        context.user_data["language"] = language
-
-        content = context.user_data.get(
-            "content"
-        )
-
-        count = context.user_data.get(
-            "count"
-        )
-
-        if content and count:
-
-            await query.edit_message_text(
-                "AI question generation शुरू हो गया है…"
-            )
-
-            try:
-
-                mode = context.user_data.get(
-                    "source_mode",
-                    context.user_data.get(
-                        "mode",
-                        "source"
-                    )
-                )
-
-                questions = await generate_questions(
-
-                    content,
-
-                    language,
-
-                    count,
-
-                    mode
-                )
-
-                source = (
-
-                    "Google Search grounded sources"
-
-                    if mode == "search"
-
-                    else
-
-                    "ECA supplied source"
-                )
-
-                await publish_questions(
-
-                    update,
-
-                    questions,
-
-                    source
-                )
-
-            except Exception as error:
-
-                log.exception(
-                    "generation failed: %s",
-                    error
-                )
-
-                await query.edit_message_text(
-
-                    "AI generation में error आया।\n\n"
-                    "Render logs और GEMINI_API_KEY check करें।"
-                )
-
-            finally:
-
-                context.user_data.clear()
-
-        else:
-
-            await query.edit_message_text(
-                "Content/topic भेजें।"
-            )
-
-
-# =========================================================
-# TEXT HANDLER
-# =========================================================
-
-async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        return
-
-    text = (
-        update.effective_message.text
-        or ""
-    ).strip()
-
-    mode = context.user_data.get(
-        "mode"
-    )
-
-
-    # -------------------------
-    # MANUAL
-    # -------------------------
-
-    if mode == "manual":
-
-        questions = parse_manual_questions(
-            text
-        )
-
-        if not questions:
-
-            await update.effective_message.reply_text(
-
-                "Question format समझ नहीं आया।\n\n"
-
-                "Q: Question\n"
-                "A: Option 1\n"
-                "B: Option 2\n"
-                "C: Option 3\n"
-                "D: Option 4\n"
-                "ANS: A\n"
-                "EXP: Explanation"
-            )
-
-            return
-
-        await publish_questions(
-
-            update,
-
-            questions,
-
-            "Admin supplied questions"
-        )
-
-        context.user_data.clear()
-
-        return
-
-
-    # -------------------------
-    # SOURCE / SEARCH
-    # -------------------------
-
-    if mode in (
-        "source",
-        "search"
-    ):
-
-        context.user_data["content"] = text
-
-        context.user_data["source_mode"] = mode
-
-        await update.effective_message.reply_text(
-
-            "कितने questions चाहिए?\n\n"
-            "1 से 20 के बीच संख्या भेजें।"
-        )
-
-        context.user_data[
-            "await_count"
-        ] = True
-
-        return
-
-
-    # -------------------------
-    # COUNT
-    # -------------------------
-
-    if context.user_data.get(
-        "await_count"
-    ):
-
-        if (
-            not text.isdigit()
-            or not 1 <= int(text) <= MAX_QUESTIONS
-        ):
-
-            await update.effective_message.reply_text(
-                "1 से 20 के बीच संख्या भेजें।"
-            )
-
-            return
-
-        context.user_data[
-            "count"
-        ] = int(text)
-
-        context.user_data[
-            "await_count"
-        ] = False
-
-        await update.effective_message.reply_text(
-
-            "Language चुनें:",
-
-            reply_markup=language_menu()
-        )
-
-        return
-
-
-    await update.effective_message.reply_text(
-        "नई quiz बनाने के लिए /start दबाएँ।"
-    )
-
-
-# =========================================================
-# FILE / PHOTO PROCESSING
-# =========================================================
-
-async def process_file_with_gemini(
-
-    update,
-
-    context,
-
-    local_path
-):
-
-    mode = context.user_data.get(
-        "mode",
-        "source"
-    )
-
-    try:
-
-        uploaded = ai.files.upload(
-            file=local_path
-        )
-
-        extraction_prompt = """
-
-Read this educational source carefully.
-
-Extract the relevant educational content faithfully.
-
-Do NOT invent missing text.
-
-Preserve:
-• facts
-• dates
-• names
-• definitions
-• concepts
-• relationships
-• tables where meaningful
-
-Create a clean textual representation that can be used
-for high-quality competitive-exam MCQ generation.
-"""
-
-        response = ai.models.generate_content(
-
-            model=MODEL,
-
-            contents=[
-                uploaded,
-                extraction_prompt
-            ]
-        )
-
-        context.user_data[
-            "content"
-        ] = response.text
-
-        context.user_data[
-            "source_mode"
-        ] = mode
-
-        await update.effective_message.reply_text(
-
-            "Source/OCR content successfully read.\n\n"
-
-            "अब कितने questions चाहिए?\n"
-            "1 से 20 के बीच संख्या भेजें।"
-        )
-
-        context.user_data[
-            "await_count"
-        ] = True
-
-    except Exception as error:
-
-        log.exception(
-            "File processing failed: %s",
-            error
-        )
-
-        await update.effective_message.reply_text(
-
-            "File/OCR processing में error आया।\n\n"
-            "कृपया clear photo/PDF भेजकर फिर कोशिश करें।"
-        )
-
-
-async def handle_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        return
-
-    if context.user_data.get(
-        "mode"
-    ) not in (
-        "source",
-        "ocr"
-    ):
-
-        await update.effective_message.reply_text(
-            "पहले /source या /ocr चुनें।"
-        )
-
-        return
-
-    photo = update.effective_message.photo[-1]
-
-    telegram_file = await context.bot.get_file(
-        photo.file_id
-    )
-
-    path = (
-        f"/tmp/eca_"
-        f"{update.effective_user.id}_"
-        f"{photo.file_unique_id}.jpg"
-    )
-
-    await telegram_file.download_to_drive(
-        path
-    )
-
-    await process_file_with_gemini(
-        update,
-        context,
-        path
-    )
-
-    try:
-
-        Path(path).unlink(
-            missing_ok=True
-        )
-
+        logger.info("Gemini client initialized.")
     except Exception:
-        pass
-
-
-async def handle_document(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_authorized(
-        update.effective_user.id
-    ):
-
-        return
-
-    if context.user_data.get(
-        "mode"
-    ) != "source":
-
-        await update.effective_message.reply_text(
-            "पहले /source चुनें।"
+        logger.exception(
+            "Could not initialize Gemini client."
         )
 
-        return
 
-    document = (
-        update.effective_message.document
-    )
+# ============================================================
+# CONVERSATION STATES
+# ============================================================
 
-    telegram_file = await context.bot.get_file(
-        document.file_id
-    )
-
-    suffix = (
-        Path(
-            document.file_name
-            or "source.bin"
-        ).suffix
-        or ".bin"
-    )
-
-    path = (
-        f"/tmp/eca_"
-        f"{update.effective_user.id}_"
-        f"{document.file_unique_id}"
-        f"{suffix}"
-    )
-
-    await telegram_file.download_to_drive(
-        path
-    )
-
-    await process_file_with_gemini(
-        update,
-        context,
-        path
-    )
-
-    try:
-
-        Path(path).unlink(
-            missing_ok=True
-        )
-
-    except Exception:
-        pass
+MODE = 0
+SOURCE_MODE = 1
+SOURCE_INPUT = 2
+TOPIC = 3
+QUESTION_COUNT = 4
+LANGUAGE = 5
 
 
-# =========================================================
+# ============================================================
+# DATA CLASS
+# ============================================================
+
+@dataclass
+class Question:
+    question: str
+    options: List[str]
+    correct_index: int
+    explanation: str
+    source: str
+    topic: str
+
+
+# ============================================================
 # RENDER HEALTH SERVER
-# =========================================================
+# ============================================================
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        body = b"ECA Quiz Maker is running"
+        if self.path in (
+            "/",
+            "/health",
+            "/healthz",
+        ):
 
-        self.send_response(
-            200
-        )
+            body = b"ECA Quiz Maker Bot is running"
 
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
+            self.send_response(200)
 
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8",
+            )
 
-        self.end_headers()
+            self.send_header(
+                "Content-Length",
+                str(len(body)),
+            )
 
-        self.wfile.write(
-            body
-        )
+            self.end_headers()
 
-    def log_message(
-        self,
-        format,
-        *args
-    ):
+            self.wfile.write(body)
 
+        else:
+
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
         return
 
 
 def start_health_server():
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
+    try:
+
+        server = HTTPServer(
+            ("0.0.0.0", PORT),
+            HealthHandler,
+        )
+
+        logger.info(
+            "Health server listening on port %s",
+            PORT,
+        )
+
+        server.serve_forever()
+
+    except Exception:
+        logger.exception(
+            "Health server stopped."
+        )
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db():
+
+    return sqlite3.connect(
+        DB_FILE,
+        timeout=30,
+    )
+
+
+def init_db():
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT NOT NULL,
+            question TEXT NOT NULL,
+            normalized_question TEXT NOT NULL,
+            source TEXT,
+            quiz_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# USER / ADMIN AUTH
+# ============================================================
+
+def is_owner(user_id: int) -> bool:
+
+    return (
+        OWNER_USER_ID != 0
+        and user_id == OWNER_USER_ID
+    )
+
+
+def is_admin(user_id: int) -> bool:
+
+    if is_owner(user_id):
+        return True
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT 1 FROM admins WHERE user_id = ?",
+        (user_id,),
+    )
+
+    result = cur.fetchone()
+
+    conn.close()
+
+    return result is not None
+
+
+# ============================================================
+# QUESTION NORMALIZATION
+# ============================================================
+
+def normalize_question(text: str) -> str:
+
+    text = text.lower().strip()
+
+    text = re.sub(
+        r"[^\w\s]",
+        " ",
+        text,
+        flags=re.UNICODE,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def question_exists(question: str) -> bool:
+
+    normalized = normalize_question(question)
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT 1
+        FROM question_history
+        WHERE normalized_question = ?
+        LIMIT 1
+        """,
+        (normalized,),
+    )
+
+    result = cur.fetchone()
+
+    conn.close()
+
+    return result is not None
+
+
+def save_question_history(
+    question: Question,
+    quiz_id: str,
+):
+
+    normalized = normalize_question(
+        question.question
+    )
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO question_history
+        (
+            topic,
+            question,
+            normalized_question,
+            source,
+            quiz_id
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            question.topic,
+            question.question,
+            normalized,
+            question.source,
+            quiz_id,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_recent_questions(
+    limit: int = 150
+) -> List[str]:
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT question
+        FROM question_history
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    return [
+        row[0]
+        for row in rows
+    ]
+
+
+# ============================================================
+# OWNER COMMANDS
+# ============================================================
+
+async def whoami(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    await update.message.reply_text(
+        "🆔 Your Telegram User ID:\n\n"
+        f"{user.id}\n\n"
+        f"Username: @{user.username}"
+        if user.username
+        else
+        "🆔 Your Telegram User ID:\n\n"
+        f"{user.id}"
+    )
+
+
+async def add_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not is_owner(user.id):
+
+        await update.message.reply_text(
+            "❌ केवल Bot Owner नया Admin authorize कर सकता है।"
+        )
+
+        return
+
+    target_id = None
+    target_name = None
+
+    # Preferred method:
+    # Owner replies to target user's message.
+    if update.message.reply_to_message:
+
+        target_user = (
+            update.message.reply_to_message.from_user
+        )
+
+        if target_user:
+
+            target_id = target_user.id
+
+            target_name = (
+                target_user.full_name
+                or target_user.username
+                or str(target_id)
+            )
+
+    # Numeric fallback
+    elif context.args:
+
+        try:
+
+            target_id = int(
+                context.args[0]
+            )
+
+            target_name = str(
+                target_id
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ User ID numeric होना चाहिए।"
+            )
+
+            return
+
+    else:
+
+        await update.message.reply_text(
+            "Admin authorize करने का सबसे आसान तरीका:\n\n"
+            "1. उस user का कोई message आने दें।\n"
+            "2. उसके message पर Reply करें।\n"
+            "3. उसी reply में /addadmin भेजें।\n\n"
+            "या:\n"
+            "/addadmin USER_ID"
+        )
+
+        return
+
+    if target_id == OWNER_USER_ID:
+
+        await update.message.reply_text(
+            "यह user पहले से Owner है।"
+        )
+
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO admins
+        (user_id, added_by)
+        VALUES (?, ?)
+        """,
+        (
+            target_id,
+            user.id,
+        ),
+    )
+
+    inserted = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    if inserted:
+
+        await update.message.reply_text(
+            "✅ Admin successfully authorized.\n\n"
+            f"Name: {target_name}\n"
+            f"User ID: {target_id}\n\n"
+            "अब यह user /start करके quiz बना सकता है।"
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "ℹ️ यह user पहले से Admin है।\n\n"
+            f"User ID: {target_id}"
+        )
+
+
+async def remove_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not is_owner(user.id):
+
+        await update.message.reply_text(
+            "❌ केवल Bot Owner Admin remove कर सकता है।"
+        )
+
+        return
+
+    target_id = None
+
+    if update.message.reply_to_message:
+
+        target_user = (
+            update.message.reply_to_message.from_user
+        )
+
+        if target_user:
+            target_id = target_user.id
+
+    elif context.args:
+
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ User ID numeric होना चाहिए।"
+            )
+
+            return
+
+    else:
+
+        await update.message.reply_text(
+            "जिस Admin को remove करना है, "
+            "उसके message पर reply करके /removeadmin भेजें।"
+        )
+
+        return
+
+    if target_id == OWNER_USER_ID:
+
+        await update.message.reply_text(
+            "❌ Owner को remove नहीं किया जा सकता।"
+        )
+
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "DELETE FROM admins WHERE user_id = ?",
+        (target_id,),
+    )
+
+    removed = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    if removed:
+
+        await update.message.reply_text(
+            "✅ Admin access removed.\n\n"
+            f"User ID: {target_id}"
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "ℹ️ यह user authorized Admin list में नहीं था।"
+        )
+
+
+async def list_admins(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not is_owner(user.id):
+
+        await update.message.reply_text(
+            "❌ केवल Owner Admin list देख सकता है।"
+        )
+
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT user_id, added_at
+        FROM admins
+        ORDER BY added_at
+        """
+    )
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    lines = [
+        "👑 ECA QUIZ MAKER ADMINS",
+        "",
+        f"Owner ID: {OWNER_USER_ID}",
+        "",
+        "Authorized Admins:",
+    ]
+
+    if not rows:
+
+        lines.append(
+            "कोई additional Admin नहीं है।"
+        )
+
+    else:
+
+        for index, row in enumerate(
+            rows,
+            start=1,
+        ):
+
+            lines.append(
+                f"{index}. {row[0]}"
+            )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    context.user_data.clear()
+
+    if not is_admin(user.id):
+
+        await update.message.reply_text(
+            "📚 ECA Quiz Maker\n\n"
+            "यह bot केवल ECA के authorized "
+            "Owner/Admins के लिए Quiz creation के लिए है।\n\n"
+            "आपके account को quiz बनाने की permission नहीं है।"
+        )
+
+        return ConversationHandler.END
+
+    keyboard = [
+        ["🤖 AI Automatic Quiz"],
+        ["📝 My Questions Quiz"],
+    ]
+
+    await update.message.reply_text(
+        "📚 ECA QUIZ MAKER\n\n"
+        "आप क्या करना चाहते हैं?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True,
+        ),
+    )
+
+    return MODE
+
+
+# ============================================================
+# MAIN MODE
+# ============================================================
+
+async def receive_mode(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    choice = update.message.text.strip()
+
+    if choice == "🤖 AI Automatic Quiz":
+
+        keyboard = [
+            ["📤 My Source"],
+            ["🔎 AI Find Source"],
+        ]
+
+        await update.message.reply_text(
+            "🤖 AI Automatic Quiz\n\n"
+            "Questions के लिए source कैसे लेना है?",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard,
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+
+        return SOURCE_MODE
+
+    if choice == "📝 My Questions Quiz":
+
+        await update.message.reply_text(
+            "📝 My Questions Quiz अभी अगले module में "
+            "enable किया जाएगा।\n\n"
+            "अभी AI Automatic Quiz पूरी तरह active है।",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "कृपया menu से option चुनिए।"
+    )
+
+    return MODE
+
+
+# ============================================================
+# SOURCE MODE
+# ============================================================
+
+async def receive_source_mode(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    choice = update.message.text.strip()
+
+    if choice == "📤 My Source":
+
+        context.user_data[
+            "source_mode"
+        ] = "provided_source"
+
+        await update.message.reply_text(
+            "📤 MY SOURCE\n\n"
+            "अब अपना source भेजिए:\n\n"
+            "📷 Photo / Image\n"
+            "📄 PDF\n"
+            "⌨️ Text\n\n"
+            "Source भेजने के बाद मैं Topic पूछूँगा।"
+        )
+
+        return SOURCE_INPUT
+
+    if choice == "🔎 AI Find Source":
+
+        context.user_data[
+            "source_mode"
+        ] = "ai_source"
+
+        await update.message.reply_text(
+            "🔎 AI FIND SOURCE\n\n"
+            "अब Topic भेजिए।\n\n"
+            "Gemini Google Search grounding का इस्तेमाल "
+            "करके relevant और authentic web sources से "
+            "information verify करेगा।"
+        )
+
+        return TOPIC
+
+    await update.message.reply_text(
+        "कृपया My Source या AI Find Source चुनिए।"
+    )
+
+    return SOURCE_MODE
+
+
+# ============================================================
+# SAVE TEXT SOURCE
+# ============================================================
+
+async def receive_source_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    text = update.message.text
+
+    if not text or len(text.strip()) < 20:
+
+        await update.message.reply_text(
+            "❌ Source बहुत छोटा है। "
+            "कृपया पर्याप्त source text भेजिए।"
+        )
+
+        return SOURCE_INPUT
+
+    context.user_data[
+        "source_text"
+    ] = text.strip()
+
+    context.user_data[
+        "source_type"
+    ] = "text"
+
+    await update.message.reply_text(
+        "✅ Source text प्राप्त हो गया।\n\n"
+        "अब Quiz का Topic बताइए।"
+    )
+
+    return TOPIC
+
+
+# ============================================================
+# DOWNLOAD TELEGRAM FILE
+# ============================================================
+
+async def download_telegram_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.message
+
+    if message.photo:
+
+        telegram_file = await context.bot.get_file(
+            message.photo[-1].file_id
+        )
+
+        suffix = ".jpg"
+
+    elif message.document:
+
+        telegram_file = await context.bot.get_file(
+            message.document.file_id
+        )
+
+        filename = (
+            message.document.file_name
+            or "source"
+        )
+
+        suffix = os.path.splitext(
+            filename
+        )[1].lower()
+
+        if not suffix:
+            suffix = ".bin"
+
+    else:
+
+        return None
+
+    temp = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix,
+    )
+
+    temp_path = temp.name
+    temp.close()
+
+    await telegram_file.download_to_drive(
+        custom_path=temp_path
+    )
+
+    return temp_path
+
+
+# ============================================================
+# PHOTO / PDF SOURCE
+# ============================================================
+
+async def receive_source_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    if not (
+        update.message.photo
+        or update.message.document
+    ):
+
+        await update.message.reply_text(
+            "कृपया Photo या PDF भेजिए।"
+        )
+
+        return SOURCE_INPUT
+
+    filename = ""
+
+    if update.message.document:
+
+        filename = (
+            update.message.document.file_name
+            or ""
+        ).lower()
+
+        if not filename.endswith(".pdf"):
+
+            await update.message.reply_text(
+                "❌ अभी My Source में PDF या Image भेजिए।"
+            )
+
+            return SOURCE_INPUT
+
+    await update.message.reply_text(
+        "⏳ Source receive हो रहा है..."
+    )
+
+    try:
+
+        path = await download_telegram_file(
+            update,
+            context,
+        )
+
+        if not path:
+
+            raise RuntimeError(
+                "File download failed."
+            )
+
+        context.user_data[
+            "source_file"
+        ] = path
+
+        context.user_data[
+            "source_type"
+        ] = (
+            "pdf"
+            if filename.endswith(".pdf")
+            else "image"
+        )
+
+        await update.message.reply_text(
+            "✅ Source successfully प्राप्त हो गया।\n\n"
+            "अब Quiz का Topic बताइए।"
+        )
+
+        return TOPIC
+
+    except Exception:
+
+        logger.exception(
+            "Source file processing failed."
+        )
+
+        await update.message.reply_text(
+            "❌ Source receive करने में समस्या हुई। "
+            "कृपया फिर से Photo/PDF भेजिए।"
+        )
+
+        return SOURCE_INPUT
+
+
+# ============================================================
+# TOPIC
+# ============================================================
+
+async def receive_topic(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    topic = update.message.text.strip()
+
+    if len(topic) < 2:
+
+        await update.message.reply_text(
+            "❌ कृपया valid Topic भेजिए।"
+        )
+
+        return TOPIC
+
+    context.user_data[
+        "topic"
+    ] = topic
+
+    await update.message.reply_text(
+        "अब कितने questions चाहिए?\n\n"
+        "1 से 100 के बीच संख्या भेजिए।\n\n"
+        "उदाहरण: 10"
+    )
+
+    return QUESTION_COUNT
+
+
+# ============================================================
+# QUESTION COUNT
+# ============================================================
+
+async def receive_question_count(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    try:
+
+        count = int(
+            update.message.text.strip()
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ केवल संख्या भेजिए।\n\n"
+            "उदाहरण: 20"
+        )
+
+        return QUESTION_COUNT
+
+    if count < 1 or count > 100:
+
+        await update.message.reply_text(
+            "❌ संख्या 1 से 100 के बीच होनी चाहिए।"
+        )
+
+        return QUESTION_COUNT
+
+    context.user_data[
+        "question_count"
+    ] = count
+
+    keyboard = [
+        ["हिंदी", "English"],
+        ["Bilingual"],
+    ]
+
+    await update.message.reply_text(
+        "Quiz की language चुनिए:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+
+    return LANGUAGE
+
+
+# ============================================================
+# LANGUAGE
+# ============================================================
+
+async def receive_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+
+        return ConversationHandler.END
+
+    language_map = {
+        "हिंदी": "Hindi",
+        "English": "English",
+        "Bilingual": "Bilingual",
+    }
+
+    choice = update.message.text.strip()
+
+    if choice not in language_map:
+
+        await update.message.reply_text(
+            "हिंदी, English या Bilingual में से चुनिए।"
+        )
+
+        return LANGUAGE
+
+    language = language_map[choice]
+
+    context.user_data[
+        "language"
+    ] = language
+
+    topic = context.user_data[
+        "topic"
+    ]
+
+    count = context.user_data[
+        "question_count"
+    ]
+
+    source_mode = context.user_data[
+        "source_mode"
+    ]
+
+    source_label = (
+        "आपके दिए हुए source"
+        if source_mode == "provided_source"
+        else "AI द्वारा Google Search से verified sources"
+    )
+
+    await update.message.reply_text(
+        "⚙️ QUIZ GENERATION STARTED\n\n"
+        f"📚 Topic: {topic}\n"
+        f"🔢 Questions: {count}\n"
+        f"🌐 Language: {language}\n"
+        f"📖 Source: {source_label}\n\n"
+        "AI rules:\n"
+        "✓ Original questions\n"
+        "✓ Existing questions copy नहीं\n"
+        "✓ केवल wording बदलकर duplicate नहीं\n"
+        "✓ पुराने ECA questions repeat नहीं\n"
+        "✓ अलग subtopics/concepts को priority\n"
+        "✓ Ambiguous questions reject\n"
+        "✓ Fact verification\n"
+        "✓ Quality over quantity\n\n"
+        "⏳ कृपया प्रतीक्षा करें..."
+    )
+
+    try:
+
+        questions = await generate_questions(
+            topic=topic,
+            count=count,
+            language=language,
+            source_mode=source_mode,
+            source_file=context.user_data.get(
+                "source_file"
+            ),
+            source_text=context.user_data.get(
+                "source_text"
+            ),
+        )
+
+        if not questions:
+
+            await update.message.reply_text(
+                "❌ इस request पर valid questions generate नहीं हो सके।\n\n"
+                "Topic/source थोड़ा अधिक specific करके फिर कोशिश करें।",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+
+            return ConversationHandler.END
+
+        quiz_id = uuid.uuid4().hex[:12]
+
+        await update.message.reply_text(
+            f"✅ {len(questions)} questions तैयार हैं।\n\n"
+            "अब Telegram Quiz शुरू किया जा रहा है..."
+        )
+
+        for question in questions:
+
+            try:
+
+                await send_quiz_poll(
+                    context=context,
+                    chat_id=update.effective_chat.id,
+                    question=question,
+                )
+
+                save_question_history(
+                    question,
+                    quiz_id,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Could not send quiz question."
+                )
+
+        await update.message.reply_text(
+            "🎯 ECA Quiz generation complete.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Question generation failed."
+        )
+
+        await update.message.reply_text(
+            "❌ AI question generation में error आया।\n\n"
+            f"Technical error: {str(exc)[:500]}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    finally:
+
+        cleanup_source_file(
+            context.user_data.get(
+                "source_file"
+            )
+        )
+
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# CLEAN TEMP SOURCE
+# ============================================================
+
+def cleanup_source_file(
+    path: Optional[str]
+):
+
+    if not path:
+        return
+
+    try:
+
+        if os.path.exists(path):
+            os.remove(path)
+
+    except Exception:
+
+        logger.warning(
+            "Could not delete temp file: %s",
+            path,
+        )
+
+
+# ============================================================
+# GEMINI SCHEMA
+# ============================================================
+
+QUESTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string"
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "correct_index": {
+                        "type": "integer"
+                    },
+                    "explanation": {
+                        "type": "string"
+                    },
+                    "source": {
+                        "type": "string"
+                    },
+                    "topic": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "question",
+                    "options",
+                    "correct_index",
+                    "explanation",
+                    "source",
+                    "topic",
+                ]
+            }
+        }
+    },
+    "required": [
+        "questions"
+    ]
+}
+
+
+# ============================================================
+# GEMINI SYSTEM INSTRUCTION
+# ============================================================
+
+SYSTEM_INSTRUCTION = """
+You are the ECA Civil Services Quiz Question Generator.
+
+You create high-quality original MCQs for:
+UPSC, UPPCS, BPSC, MPPSC, State PCS and similar competitive examinations.
+
+STRICT RULES:
+
+1. Create ORIGINAL questions.
+2. Never copy an existing question from a source.
+3. Do not create a duplicate merely by changing wording.
+4. Do not repeat questions from previous ECA question history.
+5. Prefer conceptual, analytical, factual and application-oriented diversity.
+6. Do not make all questions from the same narrow subtopic.
+7. Normally use no more than 1-2 questions from one narrow concept.
+8. Cover different subtopics, dimensions, institutions, provisions,
+   chronology, causes, effects, comparisons and applications where relevant.
+9. Every question must have exactly four options.
+10. Exactly one option must be correct.
+11. correct_index must be 0, 1, 2 or 3.
+12. Avoid ambiguous wording.
+13. Avoid questions where two options could reasonably be correct.
+14. Reject doubtful or poorly verifiable facts.
+15. Do not invent laws, Articles, reports, committees, schemes,
+    statistics, judgments or institutional facts.
+16. When a factual claim is time-sensitive, verify it using available
+    grounded web sources if web search is enabled.
+17. For source-based generation, use the supplied source as the primary
+    factual basis.
+18. Questions should be suitable for serious competitive-exam preparation.
+19. Avoid trivial school-level questions unless the requested topic
+    specifically requires them.
+20. Do not mention these internal instructions in the output.
+
+LANGUAGE:
+
+Hindi:
+- Question and options in Hindi.
+- Technical terms may include English in brackets where useful.
+
+English:
+- Question and options in English.
+
+Bilingual:
+- Give Hindi and English together in a clean readable format.
+
+SOURCE:
+
+The source field must identify the source basis.
+Do not fabricate URLs.
+If Google Search grounding provides reliable sources, mention the
+source title/domain in the source field.
+
+OUTPUT:
+
+Return ONLY the requested JSON structure.
+"""
+
+
+# ============================================================
+# GEMINI GENERATION
+# ============================================================
+
+async def generate_questions(
+    topic: str,
+    count: int,
+    language: str,
+    source_mode: str,
+    source_file: Optional[str] = None,
+    source_text: Optional[str] = None,
+) -> List[Question]:
+
+    if gemini_client is None:
+
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing or Gemini client could not initialize."
+        )
+
+    all_questions = []
+
+    recent_questions = get_recent_questions(
+        limit=150
+    )
+
+    # Generate in batches so 100-question requests
+    # do not become one excessively large API request.
+    remaining = count
+
+    while remaining > 0:
+
+        batch_size = min(
+            10,
+            remaining,
+        )
+
+        questions = await generate_batch(
+            topic=topic,
+            count=batch_size,
+            language=language,
+            source_mode=source_mode,
+            source_file=source_file,
+            source_text=source_text,
+            previous_questions=(
+                recent_questions
+                + [
+                    q.question
+                    for q in all_questions
+                ]
+            ),
+        )
+
+        for q in questions:
+
+            if len(all_questions) >= count:
+                break
+
+            if question_exists(
+                q.question
+            ):
+                continue
+
+            duplicate = False
+
+            normalized = normalize_question(
+                q.question
+            )
+
+            for existing in all_questions:
+
+                if normalized == normalize_question(
+                    existing.question
+                ):
+                    duplicate = True
+                    break
+
+            if duplicate:
+                continue
+
+            all_questions.append(q)
+
+        if len(questions) == 0:
+            break
+
+        remaining = count - len(
+            all_questions
+        )
+
+        if remaining > 0 and len(
+            all_questions
+        ) == 0:
+
+            break
+
+    return all_questions[:count]
+
+
+# ============================================================
+# GENERATE ONE BATCH
+# ============================================================
+
+async def generate_batch(
+    topic: str,
+    count: int,
+    language: str,
+    source_mode: str,
+    source_file: Optional[str],
+    source_text: Optional[str],
+    previous_questions: List[str],
+) -> List[Question]:
+
+    previous_block = ""
+
+    if previous_questions:
+
+        # Keep prompt reasonably sized.
+        previous_block = "\n".join(
+            f"- {q[:500]}"
+            for q in previous_questions[-150:]
+        )
+
+    prompt_parts = []
+
+    prompt_parts.append(
+        f"""
+Generate {count} original MCQs on this topic:
+
+TOPIC:
+{topic}
+
+LANGUAGE:
+{language}
+
+IMPORTANT:
+Create exactly {count} questions if enough valid material exists.
+
+Do NOT copy source questions.
+
+Do NOT merely paraphrase existing questions.
+
+Do NOT repeat the previous ECA questions listed below.
+
+PREVIOUS ECA QUESTIONS:
+{previous_block}
+
+Question diversity is mandatory.
+Use different subtopics/concepts/angles.
+"""
+    )
+
+    # --------------------------------------------------------
+    # SOURCE TEXT
+    # --------------------------------------------------------
+
+    if source_mode == "provided_source":
+
+        if source_text:
+
+            prompt_parts.append(
+                """
+SOURCE MATERIAL PROVIDED BY ADMIN:
+
+---------------- SOURCE START ----------------
+"""
+                + source_text[:100000]
+                + """
+---------------- SOURCE END ----------------
+
+Use this source as the primary factual basis.
+"""
+            )
+
+        elif source_file:
+
+            uploaded = None
+
+            try:
+
+                uploaded = gemini_client.files.upload(
+                    file=source_file
+                )
+
+                prompt_parts.append(
+                    """
+A source file has been supplied by the admin.
+Read and understand the complete supplied file.
+Generate questions from its factual/conceptual content.
+Do not copy any existing questions contained in it.
+"""
+                )
+
+                contents = [
+                    "\n".join(
+                        prompt_parts
+                    ),
+                    uploaded,
+                ]
+
+                return await call_gemini(
+                    contents=contents,
+                    use_search=False,
+                    topic=topic,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Gemini source file processing failed."
+                )
+
+                raise
+
+        else:
+
+            raise RuntimeError(
+                "My Source selected but no source was received."
+            )
+
+    # --------------------------------------------------------
+    # AI FIND SOURCE
+    # --------------------------------------------------------
+
+    if source_mode == "ai_source":
+
+        prompt_parts.append(
+            """
+Use Google Search grounding.
+
+Search for authoritative and reliable sources
+relevant to the topic.
+
+Prefer:
+- Government websites
+- Constitutional/legal primary sources
+- Official ministry/department websites
+- Official reports
+- Parliament/legislative sources
+- RBI/SEBI/UPSC/NCERT/WHO/UN or other relevant
+  official institutional sources where appropriate
+- Reputed primary institutional sources
+
+Verify factual claims before constructing questions.
+
+Do not rely on a random low-quality website when an
+authoritative source is available.
+"""
+        )
+
+    prompt = "\n".join(
+        prompt_parts
+    )
+
+    return await call_gemini(
+        contents=prompt,
+        use_search=(
+            source_mode == "ai_source"
+        ),
+        topic=topic,
+    )
+
+
+# ============================================================
+# CALL GEMINI
+# ============================================================
+
+async def call_gemini(
+    contents,
+    use_search: bool,
+    topic: str,
+) -> List[Question]:
+
+    tools = []
+
+    if use_search:
+
+        tools.append(
+            types.Tool(
+                google_search=types.GoogleSearch()
+            )
+        )
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.45,
+        max_output_tokens=12000,
+        response_mime_type="application/json",
+        response_schema=QUESTION_SCHEMA,
+        tools=tools if tools else None,
+    )
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=config,
+    )
+
+    if not response.text:
+
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
+
+    try:
+
+        data = json.loads(
+            response.text
+        )
+
+    except json.JSONDecodeError:
+
+        logger.error(
+            "Gemini returned invalid JSON: %s",
+            response.text[:2000],
+        )
+
+        raise RuntimeError(
+            "Gemini returned invalid JSON."
+        )
+
+    raw_questions = data.get(
+        "questions",
+        []
+    )
+
+    results = []
+
+    for item in raw_questions:
+
+        try:
+
+            question = str(
+                item["question"]
+            ).strip()
+
+            options = [
+                str(x).strip()
+                for x in item["options"]
+            ]
+
+            correct_index = int(
+                item["correct_index"]
+            )
+
+            explanation = str(
+                item.get(
+                    "explanation",
+                    ""
+                )
+            ).strip()
+
+            source = str(
+                item.get(
+                    "source",
+                    "Gemini verified source"
+                )
+            ).strip()
+
+            item_topic = str(
+                item.get(
+                    "topic",
+                    topic
+                )
+            ).strip()
+
+            if len(options) != 4:
+                continue
+
+            if correct_index not in (
+                0,
+                1,
+                2,
+                3,
+            ):
+                continue
+
+            if not question:
+                continue
+
+            if not explanation:
+                explanation = (
+                    "Correct answer is based on the verified "
+                    "factual/conceptual basis of the question."
+                )
+
+            results.append(
+                Question(
+                    question=question,
+                    options=options,
+                    correct_index=correct_index,
+                    explanation=explanation,
+                    source=source,
+                    topic=item_topic or topic,
+                )
+            )
+
+        except Exception:
+
+            logger.warning(
+                "Invalid question object skipped."
+            )
+
+    return results
+
+
+# ============================================================
+# SEND TELEGRAM QUIZ POLL
+# ============================================================
+
+async def send_quiz_poll(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    question: Question,
+):
+
+    source_text = question.source.strip()
+
+    description = (
+        f"📚 ECA\n"
+        f"Topic: {question.topic}\n\n"
+        f"Source: {source_text}\n\n"
+        "Eternal Civil Academy"
+    )
+
+    # Telegram quiz question max length is handled here.
+    poll_question = question.question[:300]
+
+    options = [
+        option[:100]
+        for option in question.options
+    ]
+
+    explanation = (
+        question.explanation[:200]
+    )
+
+    await context.bot.send_poll(
+        chat_id=chat_id,
+        question=poll_question,
+        options=options,
+        type="quiz",
+        is_anonymous=False,
+        allows_multiple_answers=False,
+        correct_option_id=question.correct_index,
+        explanation=explanation,
+    )
+
+    # Send source separately because Telegram's native
+    # poll description support can vary by Bot API/client.
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=description[:1024],
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "📚 ECA QUIZ MAKER\n\n"
+        "/start — Quiz Maker\n"
+        "/help — Help\n"
+        "/cancel — Current operation cancel\n"
+        "/whoami — अपना Telegram User ID\n\n"
+        "OWNER COMMANDS\n"
+        "/addadmin — किसी user के message पर reply करके\n"
+        "               /addadmin भेजें\n\n"
+        "/removeadmin — Admin के message पर reply करके\n"
+        "                  /removeadmin भेजें\n\n"
+        "/admins — Authorized Admins list"
+    )
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    cleanup_source_file(
+        context.user_data.get(
+            "source_file"
         )
     )
 
-    server = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            port
-        ),
-        HealthHandler
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "❌ Current operation cancelled.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
-    thread = threading.Thread(
-        target=server.serve_forever,
-        daemon=True
-    )
-
-    thread.start()
-
-    log.info(
-        "Health server listening on port %s",
-        port
-    )
+    return ConversationHandler.END
 
 
-# =========================================================
-# BOT STARTUP
-# =========================================================
+# ============================================================
+# ERROR HANDLER
+# ============================================================
 
-async def post_init(
-    application
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    # Prevent Telegram getUpdates conflict
-    # when an old webhook exists.
-
-    await application.bot.delete_webhook(
-        drop_pending_updates=True
-    )
-
-    me = await application.bot.get_me()
-
-    log.info(
-        "ECA Quiz Maker started as @%s",
-        me.username
+    logger.exception(
+        "Unhandled Telegram error:",
+        exc_info=context.error,
     )
 
 
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
 
-    start_health_server()
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN environment variable नहीं मिला।"
+        )
+
+    if OWNER_USER_ID == 0:
+
+        raise RuntimeError(
+            "OWNER_USER_ID environment variable नहीं मिला।"
+        )
+
+    if not GEMINI_API_KEY:
+
+        raise RuntimeError(
+            "GEMINI_API_KEY environment variable नहीं मिला।"
+        )
+
+    if gemini_client is None:
+
+        raise RuntimeError(
+            "Gemini client initialize नहीं हुआ।"
+        )
+
+    init_db()
 
     application = (
-
         Application.builder()
-
-        .token(
-            BOT_TOKEN
-        )
-
-        .post_init(
-            post_init
-        )
-
+        .token(BOT_TOKEN)
         .build()
     )
 
+    # --------------------------------------------------------
+    # CONVERSATION
+    # --------------------------------------------------------
 
-    # Commands
+    conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler(
+                "start",
+                start,
+            )
+        ],
 
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        states={
+
+            MODE: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_mode,
+                )
+            ],
+
+            SOURCE_MODE: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_source_mode,
+                )
+            ],
+
+            SOURCE_INPUT: [
+
+                MessageHandler(
+                    filters.PHOTO
+                    | filters.Document.PDF,
+                    receive_source_file,
+                ),
+
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_source_text,
+                ),
+            ],
+
+            TOPIC: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_topic,
+                )
+            ],
+
+            QUESTION_COUNT: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_question_count,
+                )
+            ],
+
+            LANGUAGE: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_language,
+                )
+            ],
+        },
+
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel,
+            )
+        ],
+
+        allow_reentry=True,
     )
 
     application.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel
-        )
+        conversation
     )
+
+    # --------------------------------------------------------
+    # OWNER / GENERAL COMMANDS
+    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
             "addadmin",
-            addadmin
+            add_admin,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "deladmin",
-            deladmin
+            "removeadmin",
+            remove_admin,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "admins",
-            admins
+            list_admins,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "manual",
-            manual_command
+            "whoami",
+            whoami,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "auto",
-            auto_command
+            "help",
+            help_command,
         )
     )
 
-    application.add_handler(
-        CommandHandler(
-            "source",
-            source_command
-        )
+    application.add_error_handler(
+        error_handler
     )
 
-    application.add_handler(
-        CommandHandler(
-            "search",
-            search_command
-        )
+    # --------------------------------------------------------
+    # START RENDER HEALTH SERVER
+    # --------------------------------------------------------
+
+    health_thread = threading.Thread(
+        target=start_health_server,
+        name="eca-health-server",
+        daemon=True,
     )
 
-    application.add_handler(
-        CommandHandler(
-            "ocr",
-            ocr_command
-        )
+    health_thread.start()
+
+    logger.info(
+        "ECA Quiz Maker Bot is starting..."
     )
 
-
-    # Buttons
-
-    application.add_handler(
-        CallbackQueryHandler(
-            callback
-        )
+    logger.info(
+        "Gemini model: %s",
+        GEMINI_MODEL,
     )
 
-
-    # Photo
-
-    application.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            handle_photo
-        )
-    )
-
-
-    # Documents
-
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_document
-        )
-    )
-
-
-    # Text
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text
-        )
-    )
-
-
-    log.info(
-        "ECA Quiz Maker Bot is running..."
-    )
-
-
+    # drop_pending_updates=True prevents old Telegram
+    # updates from a previous deployment from entering
+    # the new conversation state.
     application.run_polling(
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
     )
 
 
-if __name__ == "__main__":
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
+if __name__ == "__main__":
     main()
