@@ -1,8 +1,6 @@
-python-telegram-bot==22.5
-google-genai>=1.38.0
-openai>=1.107.0
-httpx>=0.28.1
-beautifulsoup4>=4.13.5
-pillow>=11.3.0
-pytesseract>=0.3.13
-python-dotenv>=1.1.1
+python-telegram-bot[job-queue]==22.8
+google-genai>=1.56.0
+SQLAlchemy>=2.0.36
+psycopg[binary]>=3.2.3
+requests>=2.32.3
+beautifulsoup4>=4.13.4
