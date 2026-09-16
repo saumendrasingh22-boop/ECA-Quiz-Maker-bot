@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: eca-quiz-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: QUIZ_CHAT_ID
+        sync: false
+      - key: ECA_TELEGRAM_URL
+        value: https://t.me/EternalCivilAcademy
+      - key: GEMINI_MODELS
+        value: gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite
+      - key: DEFAULT_QUESTION_TIME
+        value: "30"
+      - key: MAX_QUESTIONS
+        value: "100"
