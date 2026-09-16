@@ -1085,9 +1085,35 @@ def _generate_with_client( client: genai.Client, model_name: str, prompt: str, u
         contents=contents,
         config=config,
     )
-    text = getattr(response, "text", None)
+
+    # With built-in Google Search, the response can contain tool/executable
+    # parts before the final text part. Accessing response.text directly can
+    # therefore raise ValueError even though a valid text answer is present.
+    # Collect all text parts explicitly instead.
+    text_parts: list[str] = []
+    try:
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    text_parts.append(str(part_text))
+    except Exception:
+        logger.debug("Could not read Gemini candidate text parts.", exc_info=True)
+
+    if not text_parts:
+        # Safe fallback for responses that expose a direct text property.
+        try:
+            direct_text = getattr(response, "text", None)
+        except Exception:
+            direct_text = None
+        if direct_text:
+            text_parts.append(str(direct_text))
+
+    text = "\n".join(text_parts).strip()
     if not text:
-        raise RuntimeError("Gemini returned an empty response.")
+        raise RuntimeError("Gemini returned no text output after Google Search/tool execution.")
+
     def parse_json_response(raw: str) -> dict[str, Any]:
         raw = raw.strip()
         candidates = [raw]
@@ -1188,7 +1214,7 @@ async def call_ai( prompt: str, use_search: bool, source_files: Optional[list[st
                 return result
             except Exception as exc:
                 category = classify_ai_error(exc)
-                last_errors.append(f"key={key_index + 1}, model={model_name}, type={category}")
+                last_errors.append(f"key={key_index + 1}, model={model_name}, type={category}, error={str(exc)[:240]}")
                 logger.warning(
                     "Gemini error key=%s model=%s type=%s error=%s",
                     key_index + 1,
@@ -1212,7 +1238,7 @@ async def call_ai( prompt: str, use_search: bool, source_files: Optional[list[st
                         return result
                     except Exception as retry_exc:
                         last_errors.append(
-                            f"key={key_index + 1}, model={model_name}, retry_type={classify_ai_error(retry_exc)}"
+                            f"key={key_index + 1}, model={model_name}, retry_type={classify_ai_error(retry_exc)}, error={str(retry_exc)[:240]}"
                         )
                         logger.warning("Gemini retry failed: %s", str(retry_exc)[:500])
                 elif category in ("quota", "permanent"):
