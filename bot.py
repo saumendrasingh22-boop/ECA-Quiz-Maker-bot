@@ -1,3 +1,41 @@
+# -*- coding: utf-8 -*-
+"""
+ECA QUIZ MAKER â€” Production Telegram Quiz Bot
+
+Designed for Render + Telegram + Google Gemini.
+
+Core flow
+---------
+1) ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡
+2) ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾
+
+AI mode: Topic -> Count -> Language -> Gemini searches/grounds sources ->
+original MCQs -> strict validation -> prepared quiz.
+
+Source mode: PDF / Photo / Text / Telegram Poll / URL -> Topic -> Count ->
+Language -> original MCQs based on supplied material.
+
+Prepared quiz is NEVER dumped as a batch of Telegram polls.
+Admin chooses Personal or Group, then chooses per-question time:
+15 sec / 25 sec / 30 sec / 1 min.
+Exactly one native Telegram quiz poll is published at a time.
+
+Important quota behavior
+------------------------
+A 429 RESOURCE_EXHAUSTED error is a provider quota problem. Changing models
+inside the same Google project does NOT magically create quota. This bot:
+- avoids repeated hammering of the same key/model;
+- supports multiple GEMINI_API_KEYS (comma-separated);
+- uses a single bounded retry for transient failures;
+- records/returns partial valid output rather than fabricating questions;
+- never bypasses validation just to reach the requested count.
+
+For actual multi-key quota failover, keys should belong to separately usable
+projects/quotas. Never paste keys into Telegram/GitHub.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
@@ -6,6 +44,8 @@ import os
 import re
 import tempfile
 import threading
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,29 +54,12 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import (
-    Boolean,
-    DateTime,
-    Float,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
-    create_engine,
-    select,
-    update as sa_update,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-
 from google import genai
 from google.genai import types
-
-from telegram import (
-    Poll,
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from telegram import Poll, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -47,677 +70,365 @@ from telegram.ext import (
     filters,
 )
 
-# ============================================================
-# ECA QUIZ MAKER â€” PRODUCTION VERSION
-# ============================================================
-#
-# Main modes:
-#   1) ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡
-#   2) ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾
-#
-# Source mode accepts:
-#   PDF / Photo / Text / Telegram Poll / URL
-#
-# Owner-only Telegram administration:
-#   /addadmin       (reply to a user's message)
-#   /removeadmin    (reply to an admin's message)
-#   /admins
-#   /whoami
-#
-# AI:
-#   Gemini
-#   Google Search grounding
-#   Multimodal PDF/image understanding
-#   Structured JSON output
-#   Retries + model fallbacks
-#
-# Quality:
-#   Originality
-#   Exact/near duplicate prevention
-#   Previous ECA question history
-#   Narrow-topic max 1-2 questions
-#   Source verification
-#   Strict validation
-#
-# Quiz:
-#   Prepare quiz first â€” DO NOT publish all questions at once
-#   Choose Personally / Group
-#   Choose 15 sec / 25 sec / 30 sec / 1 min per question
-#   Send exactly one native Telegram quiz poll at a time
-#   Automatically advance after selected interval
-#   Native poll description with ECA source
-#   Correct / wrong tracking
-#   -1/3 negative marking
-#   Raw marks
-#   Top 50 leaderboard
-#   Equal marks = equal rank
-#
-# Render:
-#   HTTP health server on 0.0.0.0:$PORT
-#
-# ============================================================
 
-# ----------------------------
-# Environment
-# ----------------------------
+# ============================================================
+# Configuration
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0") or "0")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-PRIMARY_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash",
-).strip()
+# Primary Gemini key + optional comma-separated additional keys.
+# Example (Render Environment Variables):
+# GEMINI_API_KEY=key1
+# GEMINI_API_KEYS=key1,key2,key3
+raw_keys = os.getenv("GEMINI_API_KEYS", "").strip()
+GEMINI_API_KEYS: list[str] = []
+if raw_keys:
+    GEMINI_API_KEYS.extend([x.strip() for x in raw_keys.split(",") if x.strip()])
+if os.getenv("GEMINI_API_KEY", "").strip():
+    GEMINI_API_KEYS.insert(0, os.getenv("GEMINI_API_KEY", "").strip())
+# Remove duplicates while preserving order.
+GEMINI_API_KEYS = list(dict.fromkeys(GEMINI_API_KEYS))
 
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 FALLBACK_MODELS = [
     x.strip()
     for x in os.getenv(
         "GEMINI_FALLBACK_MODELS",
-        "gemini-3.5-flash,gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite,gemini-3.5-flash",
     ).split(",")
     if x.strip()
 ]
 
-QUIZ_DURATION_MINUTES = max(
-    5,
-    int(os.getenv("QUIZ_DURATION_MINUTES", "60")),
-)
-
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///eca_quiz_v3.db").strip()
 PORT = int(os.getenv("PORT", "10000") or "10000")
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///eca_quiz.db",
-).strip()
-
+MAX_QUESTIONS = 100
+MAX_SOURCE_TEXT = 120_000
+MAX_HISTORY_FOR_PROMPT = 250
+MAX_HISTORY_FOR_SIMILARITY = 1200
+AI_MAX_CALLS_PER_REQUEST = 8
+AI_TRANSIENT_RETRY_COUNT = 1
+AI_RETRY_DELAY = 2.0
 SOURCE_FOOTER = "Source: @EternalCivilAcademy"
 
-MAX_QUESTIONS = 100
-BATCH_SIZE = 10
-MAX_HISTORY_FOR_PROMPT = 150
-MAX_SOURCE_TEXT = 120_000
+LANGUAGE_LABELS = {
+    "à¤¹à¤¿à¤‚à¤¦à¥€": "Hindi",
+    "English": "English",
+    "à¤¦à¥à¤µà¤¿à¤­à¤¾à¤·à¥€": "Bilingual",
+}
+LANGUAGE_BUTTONS = [["à¤¹à¤¿à¤‚à¤¦à¥€", "English"], ["à¤¦à¥à¤µà¤¿à¤­à¤¾à¤·à¥€"]]
 
-# ----------------------------
-# Logging
-# ----------------------------
+TIME_OPTIONS = {
+    "15 à¤¸à¥‡à¤•à¤‚à¤¡": 15,
+    "25 à¤¸à¥‡à¤•à¤‚à¤¡": 25,
+    "30 à¤¸à¥‡à¤•à¤‚à¤¡": 30,
+    "1 à¤®à¤¿à¤¨à¤Ÿ": 60,
+}
+TIME_BUTTONS = [["15 à¤¸à¥‡à¤•à¤‚à¤¡", "25 à¤¸à¥‡à¤•à¤‚à¤¡"], ["30 à¤¸à¥‡à¤•à¤‚à¤¡", "1 à¤®à¤¿à¤¨à¤Ÿ"]]
+
+MAIN_BUTTONS = [
+    ["ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡"],
+    ["ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾"],
+]
+
+SOURCE_TYPE_BUTTONS = [
+    ["ðŸ“„ PDF", "ðŸ–¼ Photo"],
+    ["ðŸ“ Text", "ðŸ“Š Telegram Poll"],
+    ["ðŸ”— URL"],
+]
+
+
+# ============================================================
+# Logging / validation
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
 logger = logging.getLogger("eca_quiz_bot")
-
-# ----------------------------
-# Basic validation
-# ----------------------------
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is missing.")
-
 if OWNER_USER_ID == 0:
     raise RuntimeError("OWNER_USER_ID environment variable is missing.")
+if not GEMINI_API_KEYS:
+    raise RuntimeError("GEMINI_API_KEY or GEMINI_API_KEYS environment variable is missing.")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is missing.")
 
-# ----------------------------
-# Gemini
-# ----------------------------
-
-gemini = genai.Client(api_key=GEMINI_API_KEY)
-
-# ----------------------------
+# ============================================================
 # Database
-# ----------------------------
+# ============================================================
 
 class Base(DeclarativeBase):
     pass
 
 
 class Admin(Base):
-    __tablename__ = "admins"
+    __tablename__ = "eca_v3_admins"
 
-    user_id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
-    added_by: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    added_by: Mapped[int] = mapped_column(Integer, nullable=False)
     added_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
 
 class QuestionHistory(Base):
-    __tablename__ = "question_history"
+    __tablename__ = "eca_v3_question_history"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-    question_hash: Mapped[str] = mapped_column(
-        String(64),
-        unique=True,
-        nullable=False,
-    )
-    question: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    normalized_question: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    topic: Mapped[str] = mapped_column(
-        String(500),
-        nullable=False,
-    )
-    source: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    question_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_question: Mapped[str] = mapped_column(Text, nullable=False)
+    topic: Mapped[str] = mapped_column(String(500), nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
 
 class Quiz(Base):
-    __tablename__ = "quizzes"
+    __tablename__ = "eca_v3_quizzes"
 
-    id: Mapped[str] = mapped_column(
-        String(40),
-        primary_key=True,
-    )
-    chat_id: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    created_by: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    title: Mapped[str] = mapped_column(
-        String(500),
-        nullable=False,
-    )
-    question_count: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    language: Mapped[str] = mapped_column(
-        String(30),
-        nullable=False,
-    )
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    question_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    language: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
-    closes_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-    )
-    leaderboard_sent: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        nullable=False,
-    )
-
-
-class QuizPoll(Base):
-    __tablename__ = "quiz_polls"
-
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-    quiz_id: Mapped[str] = mapped_column(
-        String(40),
-        nullable=False,
-    )
-    poll_id: Mapped[str] = mapped_column(
-        String(255),
-        unique=True,
-        nullable=False,
-    )
-    question_no: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    correct_index: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    question_text: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
 
 class QuizQuestion(Base):
-    __tablename__ = "quiz_questions"
+    __tablename__ = "eca_v3_quiz_questions"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-    quiz_id: Mapped[str] = mapped_column(
-        String(40),
-        nullable=False,
-    )
-    question_no: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    question_text: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    options_json: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    correct_index: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    explanation: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    source: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    quiz_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    question_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    options_json: Mapped[str] = mapped_column(Text, nullable=False)
+    correct_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("quiz_id", "question_no", name="uq_eca_v3_quiz_question_no"),
     )
 
 
 class QuizRun(Base):
-    __tablename__ = "quiz_runs"
+    __tablename__ = "eca_v3_quiz_runs"
 
-    id: Mapped[str] = mapped_column(
-        String(60),
-        primary_key=True,
-    )
-    quiz_id: Mapped[str] = mapped_column(
-        String(40),
-        nullable=False,
-    )
-    target_chat_id: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    started_by: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    mode: Mapped[str] = mapped_column(
-        String(20),
-        nullable=False,
-    )
-    interval_seconds: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    current_question: Mapped[int] = mapped_column(
-        Integer,
-        default=0,
-        nullable=False,
-    )
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    quiz_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)  # personal/group
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_question: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
-    active: Mapped[bool] = mapped_column(
-        Boolean,
-        default=True,
-        nullable=False,
-    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    leaderboard_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class QuizPoll(Base):
+    __tablename__ = "eca_v3_quiz_polls"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    quiz_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    poll_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    question_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    correct_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closes_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class PollAnswer(Base):
-    __tablename__ = "poll_answers"
+    __tablename__ = "eca_v3_poll_answers"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-    poll_id: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-    user_id: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    user_name: Mapped[str] = mapped_column(
-        String(300),
-        nullable=False,
-    )
-    selected_index: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-    )
-    is_correct: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    poll_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    selected_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
     answered_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "poll_id",
-            "user_id",
-            name="uq_poll_user_answer",
-        ),
+        UniqueConstraint("poll_id", "user_id", name="uq_eca_v3_poll_user_answer"),
     )
 
 
-connect_args = {}
-
+connect_args: dict[str, Any] = {}
 if DATABASE_URL.startswith("sqlite"):
-    connect_args = {
-        "check_same_thread": False,
-    }
+    connect_args = {"check_same_thread": False, "timeout": 30}
 
 engine = create_engine(
     DATABASE_URL,
     connect_args=connect_args,
     pool_pre_ping=True,
+    pool_recycle=1800,
 )
-
-SessionLocal = sessionmaker(
-    bind=engine,
-    expire_on_commit=False,
-)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    if DATABASE_URL.startswith("sqlite"):
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+        except Exception:
+            logger.exception("SQLite PRAGMA setup failed; continuing.")
 
 
-# ----------------------------
+# ============================================================
 # Render health server
-# ----------------------------
+# ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def do_GET(self) -> None:
         body = b"ECA Quiz Maker Bot is running"
-
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8",
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
+    def log_message(self, fmt: str, *args: Any) -> None:
         return
 
 
 def start_health_server() -> None:
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler,
-    )
-
-    logger.info(
-        "Health server listening on 0.0.0.0:%s",
-        PORT,
-    )
-
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info("Health server listening on 0.0.0.0:%s", PORT)
     server.serve_forever()
 
 
-# ----------------------------
-# Authorization
-# ----------------------------
+# ============================================================
+# Gemini client pool / quota handling
+# ============================================================
 
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_USER_ID
+GEMINI_CLIENTS = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
 
-
-def is_admin(user_id: int) -> bool:
-    if is_owner(user_id):
-        return True
-
-    with SessionLocal() as session:
-        return session.get(Admin, user_id) is not None
+# Short in-process cooldown after a full provider quota failure, preventing
+# accidental rapid-fire admin retries from hammering the same quota.
+AI_COOLDOWN_UNTIL = 0.0
+AI_COOLDOWN_LOCK = threading.Lock()
 
 
-# ----------------------------
-# Admin management
-# ----------------------------
-
-async def whoami(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    user = update.effective_user
-
-    text = (
-        "ðŸ†” Your Telegram User ID:\n"
-        f"{user.id}\n\n"
-        f"Username: @{user.username}"
-        if user.username
-        else
-        "ðŸ†” Your Telegram User ID:\n"
-        f"{user.id}"
-    )
-
-    await update.effective_message.reply_text(text)
+class AIQuotaError(RuntimeError):
+    pass
 
 
-async def add_admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "âŒ à¤•à¥‡à¤µà¤² Owner Admin authorize à¤•à¤° à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤"
-        )
-        return
-
-    target_id: Optional[int] = None
-    target_name = "Unknown"
-
-    # Preferred: reply to the target user's message.
-    if update.effective_message.reply_to_message:
-        target = (
-            update.effective_message
-            .reply_to_message
-            .from_user
-        )
-        if target:
-            target_id = target.id
-            target_name = target.full_name or str(target.id)
-
-    # Fallback: /addadmin USER_ID
-    elif context.args:
-        try:
-            target_id = int(context.args[0])
-            target_name = str(target_id)
-        except ValueError:
-            pass
-
-    if not target_id:
-        await update.effective_message.reply_text(
-            "à¤•à¤¿à¤¸à¥€ user à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡:\n\n"
-            "/addadmin\n\n"
-            "à¤­à¥‡à¤œà¥‡à¤‚à¥¤\n\n"
-            "à¤¯à¤¾:\n"
-            "/addadmin USER_ID"
-        )
-        return
-
-    if target_id == OWNER_USER_ID:
-        await update.effective_message.reply_text(
-            "à¤¯à¤¹ user à¤ªà¤¹à¤²à¥‡ à¤¸à¥‡ Owner à¤¹à¥ˆà¥¤"
-        )
-        return
-
-    with SessionLocal() as session:
-        existing = session.get(Admin, target_id)
-
-        if existing:
-            await update.effective_message.reply_text(
-                f"â„¹ï¸ à¤¯à¤¹ user à¤ªà¤¹à¤²à¥‡ à¤¸à¥‡ Admin à¤¹à¥ˆà¥¤\n\nID: {target_id}"
-            )
-            return
-
-        session.add(
-            Admin(
-                user_id=target_id,
-                added_by=update.effective_user.id,
-            )
-        )
-        session.commit()
-
-    await update.effective_message.reply_text(
-        "âœ… Admin authorized.\n\n"
-        f"Name: {target_name}\n"
-        f"User ID: {target_id}\n\n"
-        "à¤…à¤¬ à¤¯à¤¹ user /start à¤¸à¥‡ quiz à¤¬à¤¨à¤¾ à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤"
-    )
+class AITransientError(RuntimeError):
+    pass
 
 
-async def remove_admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "âŒ à¤•à¥‡à¤µà¤² Owner Admin remove à¤•à¤° à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤"
-        )
-        return
-
-    target_id: Optional[int] = None
-
-    if update.effective_message.reply_to_message:
-        target = (
-            update.effective_message
-            .reply_to_message
-            .from_user
-        )
-        if target:
-            target_id = target.id
-
-    elif context.args:
-        try:
-            target_id = int(context.args[0])
-        except ValueError:
-            target_id = None
-
-    if not target_id:
-        await update.effective_message.reply_text(
-            "Admin à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡:\n\n"
-            "/removeadmin\n\n"
-            "à¤­à¥‡à¤œà¥‡à¤‚à¥¤"
-        )
-        return
-
-    if target_id == OWNER_USER_ID:
-        await update.effective_message.reply_text(
-            "âŒ Owner à¤•à¥‹ remove à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤œà¤¾ à¤¸à¤•à¤¤à¤¾à¥¤"
-        )
-        return
-
-    with SessionLocal() as session:
-        admin = session.get(Admin, target_id)
-
-        if not admin:
-            await update.effective_message.reply_text(
-                "â„¹ï¸ à¤¯à¤¹ user Admin à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤"
-            )
-            return
-
-        session.delete(admin)
-        session.commit()
-
-    await update.effective_message.reply_text(
-        "âœ… Admin access removed.\n\n"
-        f"User ID: {target_id}"
-    )
+class AIPermanentError(RuntimeError):
+    pass
 
 
-async def list_admins(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "âŒ à¤•à¥‡à¤µà¤² Owner Admin list à¤¦à¥‡à¤– à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤"
-        )
-        return
-
-    with SessionLocal() as session:
-        rows = session.scalars(
-            select(Admin).order_by(Admin.added_at)
-        ).all()
-
-    lines = [
-        "ðŸ‘‘ ECA QUIZ MAKER ADMINS",
-        "",
-        f"Owner: {OWNER_USER_ID}",
-        "",
-        "Authorized Admins:",
-    ]
-
-    if not rows:
-        lines.append("à¤•à¥‹à¤ˆ additional Admin à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
-    else:
-        for idx, admin in enumerate(rows, 1):
-            lines.append(
-                f"{idx}. {admin.user_id}"
-            )
-
-    await update.effective_message.reply_text(
-        "\n".join(lines)
-    )
+def classify_ai_error(exc: Exception) -> str:
+    text = str(exc).lower()
+    if any(x in text for x in ("resource_exhausted", "quota", "too many requests", "429")):
+        return "quota"
+    if any(x in text for x in ("503", "502", "504", "temporarily unavailable", "service unavailable", "timeout")):
+        return "transient"
+    if any(x in text for x in ("401", "403", "api key", "permission denied", "unauthenticated", "invalid argument")):
+        return "permanent"
+    return "other"
 
 
-# ----------------------------
-# Utility
-# ----------------------------
+def cooldown_seconds_remaining() -> int:
+    with AI_COOLDOWN_LOCK:
+        remaining = AI_COOLDOWN_UNTIL - time.time()
+    return max(0, int(remaining))
+
+
+def set_ai_cooldown(seconds: int = 45) -> None:
+    global AI_COOLDOWN_UNTIL
+    with AI_COOLDOWN_LOCK:
+        AI_COOLDOWN_UNTIL = max(AI_COOLDOWN_UNTIL, time.time() + seconds)
+
+
+# ============================================================
+# Text helpers / duplicate detection
+# ============================================================
+
+PUNCT_RE = re.compile(r"[^\w\s\u0900-\u097F]", flags=re.UNICODE)
+SPACE_RE = re.compile(r"\s+")
+
 
 def normalize(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(
-        r"[^\w\s\u0900-\u097f]",
-        " ",
-        text,
-        flags=re.UNICODE,
-    )
-    return re.sub(r"\s+", " ", text).strip()
+    text = str(text or "").strip().lower()
+    text = PUNCT_RE.sub(" ", text)
+    return SPACE_RE.sub(" ", text).strip()
+
+
+def tokens(text: str) -> set[str]:
+    return {x for x in normalize(text).split() if len(x) > 1}
+
+
+def question_similarity(a: str, b: str) -> float:
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    return inter / max(1, min(len(ta), len(tb)))
 
 
 def hash_question(question: str) -> str:
-    return hashlib.sha256(
-        normalize(question).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(normalize(question).encode("utf-8")).hexdigest()
+
+
+def exact_duplicate_exists(question: str) -> bool:
+    q_hash = hash_question(question)
+    with SessionLocal() as session:
+        row = session.scalar(
+            select(QuestionHistory.id)
+            .where(QuestionHistory.question_hash == q_hash)
+            .limit(1)
+        )
+    return row is not None
+
+
+def similar_previous_question(question: str, threshold: float = 0.84) -> bool:
+    q_tokens = tokens(question)
+    if len(q_tokens) < 4:
+        return exact_duplicate_exists(question)
+
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(QuestionHistory.normalized_question)
+            .order_by(QuestionHistory.id.desc())
+            .limit(MAX_HISTORY_FOR_SIMILARITY)
+        ).all()
+
+    for old in rows:
+        old_tokens = set(old.split())
+        if not old_tokens:
+            continue
+        score = len(q_tokens & old_tokens) / max(1, min(len(q_tokens), len(old_tokens)))
+        if score >= threshold:
+            return True
+    return False
 
 
 def recent_history(limit: int = MAX_HISTORY_FOR_PROMPT) -> list[str]:
@@ -727,553 +438,213 @@ def recent_history(limit: int = MAX_HISTORY_FOR_PROMPT) -> list[str]:
             .order_by(QuestionHistory.id.desc())
             .limit(limit)
         ).all()
+    return list(reversed(rows))
 
-    return list(rows)
 
-
-def exact_duplicate_exists(question: str) -> bool:
-    q_hash = hash_question(question)
-
+def save_history(question: dict[str, Any]) -> None:
+    text = str(question.get("question", "")).strip()
+    if not text:
+        return
+    q_hash = hash_question(text)
     with SessionLocal() as session:
-        row = session.scalar(
+        exists = session.scalar(
             select(QuestionHistory.id)
-            .where(
-                QuestionHistory.question_hash == q_hash
-            )
+            .where(QuestionHistory.question_hash == q_hash)
             .limit(1)
         )
-
-    return row is not None
-
-
-def save_history(
-    question: dict[str, Any],
-    source: str,
-) -> None:
-    q_text = question["question"]
-    q_hash = hash_question(q_text)
-
-    with SessionLocal() as session:
-        existing = session.scalar(
-            select(QuestionHistory.id)
-            .where(
-                QuestionHistory.question_hash == q_hash
-            )
-            .limit(1)
-        )
-
-        if existing:
+        if exists:
             return
-
         session.add(
             QuestionHistory(
                 question_hash=q_hash,
-                question=q_text,
-                normalized_question=normalize(q_text),
-                topic=question.get(
-                    "topic",
-                    "",
-                ),
-                source=source,
+                question=text,
+                normalized_question=normalize(text),
+                topic=str(question.get("topic", ""))[:500],
+                source=str(question.get("source", ""))[:5000],
             )
         )
-
         session.commit()
 
 
-# ----------------------------
-# URL extraction
-# ----------------------------
+# ============================================================
+# Authorization / admin commands
+# ============================================================
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_USER_ID
+
+
+def is_admin(user_id: int) -> bool:
+    if is_owner(user_id):
+        return True
+    with SessionLocal() as session:
+        return session.get(Admin, user_id) is not None
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    username = f"@{user.username}" if user and user.username else "â€”"
+    await update.effective_message.reply_text(
+        f"ðŸ†” Telegram User ID\n{user.id}\n\nUsername: {username}"
+    )
+
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² Owner Admin à¤œà¥‹à¤¡à¤¼ à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤")
+        return
+
+    target_id: Optional[int] = None
+    target_name = ""
+    reply = update.effective_message.reply_to_message
+    if reply and reply.from_user:
+        target_id = reply.from_user.id
+        target_name = reply.from_user.full_name
+    elif context.args:
+        try:
+            target_id = int(context.args[0])
+            target_name = str(target_id)
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        await update.effective_message.reply_text(
+            "à¤•à¤¿à¤¸à¥€ user à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡ /addadmin à¤­à¥‡à¤œà¥‡à¤‚à¥¤\n\n"
+            "à¤¯à¤¾ /addadmin USER_ID"
+        )
+        return
+
+    if target_id == OWNER_USER_ID:
+        await update.effective_message.reply_text("â„¹ï¸ à¤¯à¤¹ user à¤ªà¤¹à¤²à¥‡ à¤¸à¥‡ Owner à¤¹à¥ˆà¥¤")
+        return
+
+    with SessionLocal() as session:
+        if session.get(Admin, target_id):
+            await update.effective_message.reply_text(f"â„¹ï¸ à¤¯à¤¹ user à¤ªà¤¹à¤²à¥‡ à¤¸à¥‡ Admin à¤¹à¥ˆà¥¤\nID: {target_id}")
+            return
+        session.add(Admin(user_id=target_id, added_by=OWNER_USER_ID))
+        session.commit()
+
+    await update.effective_message.reply_text(
+        f"âœ… Admin authorized\n\nName: {target_name}\nUser ID: {target_id}"
+    )
+
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² Owner Admin remove à¤•à¤° à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤")
+        return
+
+    target_id: Optional[int] = None
+    reply = update.effective_message.reply_to_message
+    if reply and reply.from_user:
+        target_id = reply.from_user.id
+    elif context.args:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        await update.effective_message.reply_text("Admin à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡ /removeadmin à¤­à¥‡à¤œà¥‡à¤‚à¥¤")
+        return
+    if target_id == OWNER_USER_ID:
+        await update.effective_message.reply_text("âŒ Owner à¤•à¥‹ remove à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤œà¤¾ à¤¸à¤•à¤¤à¤¾à¥¤")
+        return
+
+    with SessionLocal() as session:
+        admin = session.get(Admin, target_id)
+        if not admin:
+            await update.effective_message.reply_text("â„¹ï¸ à¤¯à¤¹ user Admin à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+            return
+        session.delete(admin)
+        session.commit()
+
+    await update.effective_message.reply_text(f"âœ… Admin access removed\nUser ID: {target_id}")
+
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² Owner Admin list à¤¦à¥‡à¤– à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤")
+        return
+
+    with SessionLocal() as session:
+        rows = session.scalars(select(Admin).order_by(Admin.added_at)).all()
+
+    lines = ["ðŸ‘‘ ECA QUIZ MAKER ADMINS", "", f"Owner: {OWNER_USER_ID}", "", "Authorized Admins:"]
+    if not rows:
+        lines.append("à¤•à¥‹à¤ˆ additional Admin à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+    else:
+        lines.extend(f"{i}. {row.user_id}" for i, row in enumerate(rows, 1))
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+# ============================================================
+# URL / file utilities
+# ============================================================
+
 
 def fetch_url_text(url: str) -> str:
     parsed = urlparse(url)
-
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Only HTTP/HTTPS URLs are supported.")
 
     response = requests.get(
         url,
-        timeout=20,
+        timeout=25,
+        allow_redirects=True,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(compatible; ECAQuizMaker/1.0)"
-            )
+            "User-Agent": "Mozilla/5.0 (compatible; ECAQuizMaker/3.0; +https://t.me/EternalCivilAcademy)"
         },
     )
-
     response.raise_for_status()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser",
-    )
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "text/html" not in content_type and "text/plain" not in content_type:
+        raise ValueError("The URL did not return readable HTML/text content.")
 
-    for tag in soup(
-        [
-            "script",
-            "style",
-            "noscript",
-            "svg",
-        ]
-    ):
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
         tag.decompose()
 
-    text = soup.get_text(
-        "\n",
-        strip=True,
-    )
-
+    text = soup.get_text("\n", strip=True)
+    text = SPACE_RE.sub(" ", text)
     if len(text) < 100:
-        raise ValueError(
-            "The webpage did not expose enough readable text."
-        )
-
+        raise ValueError("The webpage did not expose enough readable text.")
     return text[:MAX_SOURCE_TEXT]
 
 
-# ----------------------------
-# Telegram file download
-# ----------------------------
-
-async def download_message_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> tuple[str, str]:
-
+async def download_message_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
     message = update.effective_message
-
     if message.photo:
-        file_obj = await context.bot.get_file(
-            message.photo[-1].file_id
-        )
+        tg_file = await context.bot.get_file(message.photo[-1].file_id)
         suffix = ".jpg"
-
     elif message.document:
-        file_obj = await context.bot.get_file(
-            message.document.file_id
-        )
-
-        filename = (
-            message.document.file_name
-            or "source"
-        )
-
-        suffix = Path(filename).suffix.lower()
-
-        if not suffix:
-            suffix = ".bin"
-
+        tg_file = await context.bot.get_file(message.document.file_id)
+        suffix = Path(message.document.file_name or "source").suffix.lower() or ".bin"
     else:
-        raise ValueError(
-            "No supported file was found."
-        )
+        raise ValueError("No supported file found.")
 
-    temp = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix,
-    )
-
-    temp_path = temp.name
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    path = temp.name
     temp.close()
+    await tg_file.download_to_drive(custom_path=path)
+    return path, suffix
 
-    await file_obj.download_to_drive(
-        custom_path=temp_path
-    )
 
-    return temp_path, suffix
+def cleanup_file(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        logger.warning("Could not clean temporary file: %s", path)
 
 
-# ----------------------------
-# Telegram UI
-# ----------------------------
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-    """Start a new quiz workflow or open a prepared quiz by deep link."""
-
-    context.user_data.clear()
-
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "ðŸ“š ECA Quiz Maker\n\n"
-            "Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
-        )
-        return ConversationHandler.END
-
-    args = context.args or []
-    if args and args[0].startswith("quiz_"):
-        quiz_id = args[0][5:]
-        with SessionLocal() as session:
-            quiz = session.get(Quiz, quiz_id)
-
-        if not quiz:
-            await update.effective_message.reply_text(
-                "âŒ à¤¯à¤¹ quiz link valid à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆ à¤¯à¤¾ quiz à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤"
-            )
-            return ConversationHandler.END
-
-        context.user_data["prepared_quiz_id"] = quiz_id
-        context.user_data["topic"] = quiz.title
-        context.user_data["question_count"] = quiz.question_count
-        context.user_data["language"] = quiz.language
-
-        await update.effective_message.reply_text(
-            "ðŸŽ¯ QUIZ READY\n\n"
-            f"Topic: {quiz.title}\n"
-            f"Questions: {quiz.question_count}\n\n"
-            "Quiz à¤•à¤¹à¤¾à¤ à¤¶à¥à¤°à¥‚ à¤•à¤°à¤¨à¤¾ à¤¹à¥ˆ?"
-        )
-        await update.effective_message.reply_text(
-            "ðŸ‘‡ Start location à¤šà¥à¤¨à¥‡à¤‚:",
-            reply_markup=ReplyKeyboardMarkup(
-                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
-        )
-        return 7
-
-    keyboard = [
-        ["ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡"],
-        ["ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾"],
-    ]
-
-    await update.effective_message.reply_text(
-        "ðŸ“š ETERNAL CIVIL ACADEMY\n"
-        "QUIZ MAKER\n\n"
-        "à¤†à¤ª à¤•à¥à¤¯à¤¾ à¤•à¤°à¤¨à¤¾ à¤šà¤¾à¤¹à¤¤à¥‡ à¤¹à¥ˆà¤‚?",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
-
-    return 0
-
-
-async def choose_mode(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    choice = update.effective_message.text.strip()
-
-    if choice == "ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡":
-        context.user_data["mode"] = "ai"
-        await update.effective_message.reply_text(
-            "Topic à¤­à¥‡à¤œà¤¿à¤à¥¤\n\n"
-            "AI à¤¸à¥à¤µà¤¯à¤‚ authoritative sources à¤–à¥‹à¤œà¥‡à¤—à¤¾, "
-            "facts verify à¤•à¤°à¥‡à¤—à¤¾ à¤”à¤° original questions à¤¬à¤¨à¤¾à¤à¤—à¤¾à¥¤"
-        )
-        return 2
-
-    if choice == "ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾":
-        context.user_data["mode"] = "source"
-
-        keyboard = [
-            ["ðŸ“„ PDF", "ðŸ–¼ Photo"],
-            ["ðŸ“ Text", "ðŸ“Š Telegram Poll"],
-            ["ðŸ”— URL"],
-        ]
-
-        await update.effective_message.reply_text(
-            "Source à¤•à¤¾ à¤ªà¥à¤°à¤•à¤¾à¤° à¤šà¥à¤¨à¥‡à¤‚:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard,
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
-        )
-
-        return 1
-
-    await update.effective_message.reply_text(
-        "à¤•à¥ƒà¤ªà¤¯à¤¾ à¤¦à¤¿à¤ à¤—à¤ options à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤"
-    )
-
-    return 0
-
-
-async def choose_source_type(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    choice = update.effective_message.text.strip()
-
-    mapping = {
-        "ðŸ“„ PDF": "pdf",
-        "ðŸ–¼ Photo": "photo",
-        "ðŸ“ Text": "text",
-        "ðŸ“Š Telegram Poll": "poll",
-        "ðŸ”— URL": "url",
-    }
-
-    if choice not in mapping:
-        await update.effective_message.reply_text(
-            "à¤•à¥ƒà¤ªà¤¯à¤¾ source type à¤šà¥à¤¨à¥‡à¤‚à¥¤"
-        )
-        return 1
-
-    source_type = mapping[choice]
-
-    context.user_data[
-        "source_type"
-    ] = source_type
-
-    if source_type == "text":
-        await update.effective_message.reply_text(
-            "à¤…à¤¬ source text à¤­à¥‡à¤œà¤¿à¤à¥¤"
-        )
-        return 3
-
-    if source_type == "url":
-        await update.effective_message.reply_text(
-            "à¤…à¤¬ webpage à¤•à¤¾ URL à¤­à¥‡à¤œà¤¿à¤à¥¤"
-        )
-        return 3
-
-    if source_type == "poll":
-        await update.effective_message.reply_text(
-            "à¤…à¤¬ Telegram Poll à¤•à¥‹ à¤¯à¤¹à¤¾à¤ à¤­à¥‡à¤œ/forward à¤•à¤°à¥‡à¤‚à¥¤"
-        )
-        return 4
-
-    if source_type == "pdf":
-        await update.effective_message.reply_text(
-            "à¤…à¤¬ PDF document à¤­à¥‡à¤œà¤¿à¤à¥¤"
-        )
-        return 4
-
-    await update.effective_message.reply_text(
-        "à¤…à¤¬ clear book/page photo à¤­à¥‡à¤œà¤¿à¤à¥¤"
-    )
-
-    return 4
-
-
-async def receive_source_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    text = update.effective_message.text.strip()
-
-    source_type = context.user_data.get(
-        "source_type"
-    )
-
-    if source_type == "url":
-
-        if not re.match(
-            r"^https?://",
-            text,
-            flags=re.I,
-        ):
-            await update.effective_message.reply_text(
-                "âŒ Valid http/https URL à¤­à¥‡à¤œà¤¿à¤à¥¤"
-            )
-            return 3
-
-        await update.effective_message.reply_text(
-            "â³ URL content à¤ªà¤¢à¤¼à¤¾ à¤œà¤¾ à¤°à¤¹à¤¾ à¤¹à¥ˆ..."
-        )
-
-        try:
-            content = await asyncio.to_thread(
-                fetch_url_text,
-                text,
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "URL fetch failed."
-            )
-            await update.effective_message.reply_text(
-                "âŒ URL read à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\n"
-                "à¤•à¥ƒà¤ªà¤¯à¤¾ accessible webpage à¤­à¥‡à¤œà¥‡à¤‚à¥¤"
-            )
-            return 3
-
-        context.user_data["source_text"] = content
-
-    else:
-
-        if len(text) < 20:
-            await update.effective_message.reply_text(
-                "âŒ Source à¤¬à¤¹à¥à¤¤ à¤›à¥‹à¤Ÿà¤¾ à¤¹à¥ˆà¥¤"
-            )
-            return 3
-
-        context.user_data["source_text"] = (
-            text[:MAX_SOURCE_TEXT]
-        )
-
-    await update.effective_message.reply_text(
-        "à¤…à¤¬ Topic à¤¬à¤¤à¤¾à¤‡à¤à¥¤"
-    )
-
-    return 2
-
-
-async def receive_source_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    source_type = context.user_data.get(
-        "source_type"
-    )
-
-    # Telegram poll
-    if (
-        source_type == "poll"
-        and update.effective_message.poll
-    ):
-
-        poll: Poll = update.effective_message.poll
-
-        options = [
-            opt.text
-            for opt in poll.options
-        ]
-
-        correct_index = getattr(
-            poll,
-            "correct_option_id",
-            None,
-        )
-
-        poll_text = (
-            "TELEGRAM POLL SOURCE\n\n"
-            f"Question: {poll.question}\n\n"
-            "Options:\n"
-            + "\n".join(
-                f"{chr(65+i)}. {opt}"
-                for i, opt in enumerate(options)
-            )
-        )
-
-        if correct_index is not None:
-            poll_text += (
-                f"\n\nAvailable correct option: "
-                f"{chr(65 + correct_index)}"
-            )
-
-        explanation = getattr(
-            poll,
-            "explanation",
-            None,
-        )
-
-        if explanation:
-            poll_text += (
-                f"\nExplanation: {explanation}"
-            )
-
-        context.user_data[
-            "source_text"
-        ] = poll_text[:MAX_SOURCE_TEXT]
-
-        context.user_data[
-            "source_type"
-        ] = "poll"
-
-        await update.effective_message.reply_text(
-            "âœ… Poll source received.\n\n"
-            "à¤…à¤¬ Topic à¤¬à¤¤à¤¾à¤‡à¤à¥¤"
-        )
-
-        return 2
-
-    # File source
-    if (
-        source_type in ("pdf", "photo")
-        and (
-            update.effective_message.photo
-            or update.effective_message.document
-        )
-    ):
-
-        await update.effective_message.reply_text(
-            "â³ Source file receive à¤¹à¥‹ à¤°à¤¹à¥€ à¤¹à¥ˆ..."
-        )
-
-        try:
-
-            path, suffix = await download_message_file(
-                update,
-                context,
-            )
-
-            if source_type == "pdf":
-                if suffix != ".pdf":
-                    cleanup_file(path)
-                    await update.effective_message.reply_text(
-                        "âŒ PDF mode à¤®à¥‡à¤‚ à¤•à¥‡à¤µà¤² PDF à¤­à¥‡à¤œà¤¿à¤à¥¤"
-                    )
-                    return 4
-
-            context.user_data[
-                "source_file"
-            ] = path
-
-            context.user_data[
-                "source_suffix"
-            ] = suffix
-
-            await update.effective_message.reply_text(
-                "âœ… Source received.\n\n"
-                "à¤…à¤¬ Topic à¤¬à¤¤à¤¾à¤‡à¤à¥¤"
-            )
-
-            return 2
-
-        except Exception:
-            logger.exception(
-                "File download failed."
-            )
-
-            await update.effective_message.reply_text(
-                "âŒ File receive à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¥€à¥¤"
-            )
-
-            return 4
-
-    await update.effective_message.reply_text(
-        "âŒ à¤¸à¤¹à¥€ source à¤­à¥‡à¤œà¤¿à¤à¥¤"
-    )
-
-    return 4
-
-
-# ----------------------------
-# Question generation schema
-# ----------------------------
+# ============================================================
+# Question schema / prompt
+# ============================================================
 
 QUESTION_SCHEMA = {
     "type": "object",
@@ -1283,27 +654,12 @@ QUESTION_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "question": {
-                        "type": "string",
-                    },
-                    "options": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                        },
-                    },
-                    "correct_index": {
-                        "type": "integer",
-                    },
-                    "explanation": {
-                        "type": "string",
-                    },
-                    "source": {
-                        "type": "string",
-                    },
-                    "topic": {
-                        "type": "string",
-                    },
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "correct_index": {"type": "integer"},
+                    "explanation": {"type": "string"},
+                    "source": {"type": "string"},
+                    "topic": {"type": "string"},
                 },
                 "required": [
                     "question",
@@ -1314,74 +670,38 @@ QUESTION_SCHEMA = {
                     "topic",
                 ],
             },
-        },
+        }
     },
-    "required": [
-        "questions",
-    ],
+    "required": ["questions"],
 }
 
 
 SYSTEM_INSTRUCTION = """
-You are the senior competitive-exam question setter for
-Eternal Civil Academy (ECA).
+You are the senior competitive-exam question setter for Eternal Civil Academy (ECA).
+Target: UPSC, UPPSC/PCS, BPSC, MPPSC, State PCS and similarly serious exams.
 
-Target level:
-UPSC, UPPSC/PCS, BPSC, MPPSC, State PCS and similar serious
-competitive examinations.
+NON-NEGOTIABLE:
+- Create ORIGINAL MCQs. Never copy or closely paraphrase a source question.
+- Never repeat previous ECA questions or obvious near-duplicates.
+- Exactly 4 options and exactly 1 correct option.
+- Questions must be objective, unambiguous, exam-standard and factually supportable.
+- Never invent an Article, Act, rule, committee, judgment, report, scheme, statistic, date or institutional fact.
+- Prefer primary/authoritative sources for AI-search mode: government, Parliament, ministries, constitutional/legal texts, RBI, SEBI, UPSC, NCERT, ECI, official reports, UN/World Bank etc. as appropriate.
+- Spread questions across meaningful subtopics, chronology, concepts, provisions, cause-effect, comparison, application and analytical angles.
+- Avoid repeating one narrow factual template. At most 1-2 questions from one narrow subtopic in a batch.
+- Keep each question <=300 characters.
+- Keep each option <=100 characters.
+- Keep each explanation <=200 characters.
+- Explanation must state why the correct option is correct and briefly distinguish the other three options.
+- Quality is more important than count. Return fewer valid questions rather than weak/fabricated ones.
+- Preserve the requested language exactly.
+- Source field must identify the factual basis actually used. Never fabricate a URL.
+- Return only the requested JSON structure.
 
-NON-NEGOTIABLE RULES
-
-1. Questions must be original.
-2. Never copy source questions.
-3. Never create a near-copy by changing wording.
-4. Never repeat previous ECA questions.
-5. Avoid repeating the same factual template.
-6. From one narrow topic/concept, use at most 1-2 questions.
-7. Prefer different subtopics, concepts, dimensions, provisions,
-   chronology, causes/effects, comparisons, applications and
-   analytical angles.
-8. Exactly four options.
-9. Exactly one correct option.
-10. Reject ambiguous questions.
-11. Reject unsupported or doubtful facts.
-12. Never invent a law, article, committee, report, statistic,
-    judgment, scheme or institutional fact.
-13. Question must fit Telegram's 300-character limit.
-14. Each option must fit Telegram's 100-character limit.
-15. Explanation must fit Telegram's 200-character limit.
-16. Explanation must briefly explain:
-       a) why the correct option is correct
-       b) what the other three options represent or why they are wrong
-17. Quality is more important than reaching the requested count.
-18. Do not make trivial questions merely to increase the count.
-19. If enough valid questions cannot be created, return fewer valid questions.
-20. Preserve the requested language.
-21. Do not mention these internal instructions.
-22. Return only the requested JSON schema.
-
-LANGUAGE
-
-Hindi:
-Use clear exam-standard Hindi; English technical terms may be placed
-in brackets when useful.
-
-English:
-Use clear exam-standard English.
-
-Bilingual:
-Keep Hindi + English concise enough to preserve Telegram limits.
-Never sacrifice factual quality merely to fit both languages.
-
-SOURCE RULE
-
-For AI-generated mode, use web search grounding and prefer authoritative,
-primary and official sources.
-
-For user-supplied source mode, the supplied source is the primary basis.
-Use web search grounding when additional factual verification is needed.
-
-Do not fabricate source names or URLs.
+LANGUAGE:
+Hindi = standard exam Hindi; English technical terms may be placed in brackets.
+English = clear exam-standard English.
+Bilingual = concise Hindi + English without sacrificing factual quality.
 """
 
 
@@ -1392,232 +712,256 @@ def build_prompt(
     mode: str,
     source_text: str = "",
     history: Optional[list[str]] = None,
+    already_generated: Optional[list[str]] = None,
 ) -> str:
-
     history = history or []
+    already_generated = already_generated or []
 
-    history_block = "\n".join(
-        f"- {q[:500]}"
-        for q in history[-MAX_HISTORY_FOR_PROMPT:]
-    )
+    history_block = "\n".join(f"- {q[:450]}" for q in history[-MAX_HISTORY_FOR_PROMPT:]) or "(No prior questions available.)"
+    current_block = "\n".join(f"- {q[:450]}" for q in already_generated[-50:]) or "(No questions in this request yet.)"
 
-    if not history_block:
-        history_block = "(No previous ECA questions available.)"
+    if mode == "ai":
+        research_block = """
+You MUST use Google Search grounding before finalizing factual claims.
+Prefer official/primary sources. Cross-check important facts when appropriate.
+Do not rely on unsupported memory for current or legal/official facts.
+"""
+    else:
+        research_block = """
+The supplied source is the PRIMARY basis. Use only the supplied material for
+facts unless an additional verification is genuinely necessary. Do not replace
+it with unrelated information. Do not copy any source MCQ.
+"""
 
     source_block = ""
-
     if source_text:
         source_block = (
-            "\n\nPRIMARY SOURCE MATERIAL:\n"
+            "\nPRIMARY SOURCE MATERIAL\n"
             "---------------- START ----------------\n"
             f"{source_text[:MAX_SOURCE_TEXT]}\n"
             "---------------- END ----------------\n"
         )
 
-    if mode == "ai":
-        search_instruction = """
-You MUST use Google Search grounding.
-
-Search for authoritative, preferably primary sources.
-Prefer government domains, ministries/departments, official reports,
-constitutional/legal texts, Parliament, RBI, SEBI, UPSC, NCERT, ECI,
-UN/World Bank/other relevant authoritative institutions as appropriate.
-
-Verify important factual claims before using them.
-"""
-    else:
-        search_instruction = """
-Use the supplied source as the primary factual basis.
-Use Google Search grounding only when verification/context is needed.
-Do not replace the supplied source with unrelated material.
-"""
-
     return f"""
-Create up to {count} ORIGINAL MCQs on:
+Create up to {count} ORIGINAL MCQs.
 
 TOPIC:
 {topic}
 
-LANGUAGE:
+REQUESTED LANGUAGE:
 {language}
 
-{search_instruction}
+{research_block}
 
-ORIGINALITY:
-The following are previous ECA questions and MUST NOT be repeated
-or closely paraphrased:
-
+PREVIOUS ECA QUESTIONS â€” DO NOT REPEAT OR CLOSELY PARAPHRASE:
 {history_block}
 
-{source_block}
+QUESTIONS ALREADY CREATED IN THIS REQUEST â€” DO NOT REPEAT:
+{current_block}
 
 DIVERSITY:
-Do not make multiple questions from the same narrow concept.
-Maximum 1-2 questions from one narrow topic/concept.
-Distribute across meaningful subtopics and angles.
+Use different meaningful subtopics/angles. Do not make a list of the same
+factual pattern. If the topic is narrow, return fewer questions.
 
-VALIDITY:
-Exactly 4 options.
-Exactly one correct option.
-No ambiguity.
-No unsupported claims.
+STRICT OUTPUT:
+Exactly four options. Exactly one correct index (0-3). No ambiguity.
+Every source field must describe the real factual basis.
+{source_block}
 
-EXPLANATION:
-Within 200 characters.
-First explain the correct answer.
-Then briefly explain the other three options.
-
-SOURCE FIELD:
-Give the source basis used for the factual content.
-Do not invent URLs.
-
-Return only valid JSON.
+Return only valid JSON matching the supplied schema.
 """
 
 
-# ----------------------------
-# AI call + fallback
-# ----------------------------
-
-def error_code(exc: Exception) -> str:
-    text = str(exc).lower()
-
-    for code in (
-        "429",
-        "503",
-        "502",
-        "504",
-        "500",
-        "timeout",
-        "temporarily unavailable",
-        "unavailable",
-    ):
-        if code in text:
-            return code
-
-    return "other"
+# ============================================================
+# Gemini calls
+# ============================================================
 
 
-def should_retry(exc: Exception) -> bool:
-    return error_code(exc) in {
-        "429",
-        "503",
-        "502",
-        "504",
-        "500",
-        "timeout",
-        "temporarily unavailable",
-        "unavailable",
-    }
-
-
-def generate_with_model(
+def _generate_with_client(
+    client: genai.Client,
     model_name: str,
-    contents: Any,
+    prompt: str,
     use_search: bool,
+    source_files: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-
-    tools = []
-
+    tools: list[Any] = []
     if use_search:
-        tools.append(
-            types.Tool(
-                google_search=types.GoogleSearch()
-            )
-        )
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
-        temperature=0.4,
+        temperature=0.25,
         max_output_tokens=12000,
         response_mime_type="application/json",
         response_schema=QUESTION_SCHEMA,
         tools=tools or None,
     )
 
-    response = gemini.models.generate_content(
+    contents: list[Any] = [prompt]
+    for path in source_files or []:
+        uploaded = client.files.upload(file=path)
+        contents.append(uploaded)
+
+    response = client.models.generate_content(
         model=model_name,
         contents=contents,
         config=config,
     )
-
-    if not response.text:
-        raise RuntimeError(
-            "The AI returned an empty response."
-        )
-
-    return json.loads(
-        response.text
-    )
+    text = getattr(response, "text", None)
+    if not text:
+        raise RuntimeError("Gemini returned an empty response.")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Gemini returned invalid JSON despite structured output.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Gemini response was not a JSON object.")
+    return data
 
 
 async def call_ai(
-    contents: Any,
+    prompt: str,
     use_search: bool,
+    source_files: Optional[list[str]] = None,
 ) -> dict[str, Any]:
+    remaining = cooldown_seconds_remaining()
+    if remaining > 0:
+        raise AIQuotaError(f"AI is temporarily cooling down after a quota failure. Retry in about {remaining}s.")
 
     models = []
+    for name in [PRIMARY_MODEL] + FALLBACK_MODELS:
+        if name and name not in models:
+            models.append(name)
 
-    for model in (
-        [PRIMARY_MODEL]
-        + FALLBACK_MODELS
-    ):
-        if model and model not in models:
-            models.append(model)
+    last_errors: list[str] = []
+    attempts = 0
+    max_attempts = max(1, AI_MAX_CALLS_PER_REQUEST)
 
-    last_error: Optional[Exception] = None
-
-    for model in models:
-
-        for attempt in range(3):
-
+    for key_index, client in enumerate(GEMINI_CLIENTS):
+        for model_name in models:
+            attempts += 1
+            if attempts > max_attempts:
+                break
             try:
-
                 result = await asyncio.to_thread(
-                    generate_with_model,
-                    model,
-                    contents,
+                    _generate_with_client,
+                    client,
+                    model_name,
+                    prompt,
                     use_search,
+                    source_files,
                 )
-
-                logger.info(
-                    "Generation succeeded with model=%s attempt=%s",
-                    model,
-                    attempt + 1,
-                )
-
+                logger.info("Gemini success key=%s model=%s", key_index + 1, model_name)
                 return result
-
             except Exception as exc:
-
-                last_error = exc
-
+                category = classify_ai_error(exc)
+                last_errors.append(f"key={key_index + 1}, model={model_name}, type={category}")
                 logger.warning(
-                    "AI error model=%s attempt=%s code=%s",
-                    model,
-                    attempt + 1,
-                    error_code(exc),
+                    "Gemini error key=%s model=%s type=%s error=%s",
+                    key_index + 1,
+                    model_name,
+                    category,
+                    str(exc)[:500],
                 )
 
-                if not should_retry(exc):
-                    break
+                if category == "transient":
+                    await asyncio.sleep(AI_RETRY_DELAY)
+                    try:
+                        result = await asyncio.to_thread(
+                            _generate_with_client,
+                            client,
+                            model_name,
+                            prompt,
+                            use_search,
+                            source_files,
+                        )
+                        logger.info("Gemini retry success key=%s model=%s", key_index + 1, model_name)
+                        return result
+                    except Exception as retry_exc:
+                        last_errors.append(
+                            f"key={key_index + 1}, model={model_name}, retry_type={classify_ai_error(retry_exc)}"
+                        )
+                        logger.warning("Gemini retry failed: %s", str(retry_exc)[:500])
+                elif category in ("quota", "permanent"):
+                    continue
+                else:
+                    await asyncio.sleep(1)
 
-                await asyncio.sleep(
-                    min(
-                        2 ** attempt,
-                        8,
-                    )
-                )
+        if attempts > max_attempts:
+            break
 
-    raise RuntimeError(
-        "AI generation failed after all configured retries "
-        f"and model fallbacks. Last error: {last_error}"
-    )
+    quota_seen = any("type=quota" in x or "retry_type=quota" in x for x in last_errors)
+    if quota_seen:
+        set_ai_cooldown(45)
+        raise AIQuotaError(
+            "Gemini quota/rate limit was exhausted across the configured models/keys."
+        )
+    raise AIPermanentError("AI generation failed. Details: " + "; ".join(last_errors[-8:]))
 
 
-# ----------------------------
-# Build contents
-# ----------------------------
+# ============================================================
+# Validation / generation
+# ============================================================
+
+
+def valid_question(item: dict[str, Any]) -> bool:
+    try:
+        question = str(item.get("question", "")).strip()
+        options = [str(x).strip() for x in item.get("options", [])]
+        correct_index = int(item.get("correct_index"))
+        explanation = str(item.get("explanation", "")).strip()
+        source = str(item.get("source", "")).strip()
+        topic = str(item.get("topic", "")).strip()
+
+        if not question or len(question) > 300:
+            return False
+        if len(options) != 4:
+            return False
+        if any(not x or len(x) > 100 for x in options):
+            return False
+        if len({normalize(x) for x in options}) != 4:
+            return False
+        if correct_index not in (0, 1, 2, 3):
+            return False
+        if not explanation or len(explanation) > 200:
+            return False
+        if not source or not topic:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def post_validate(
+    candidates: list[dict[str, Any]],
+    accepted: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    accepted = list(accepted or [])
+    subtopic_counts: dict[str, int] = {}
+
+    for old in accepted:
+        key = normalize(str(old.get("topic", "")))
+        subtopic_counts[key] = subtopic_counts.get(key, 0) + 1
+
+    valid: list[dict[str, Any]] = []
+    for item in candidates:
+        if not isinstance(item, dict) or not valid_question(item):
+            continue
+        question = str(item["question"]).strip()
+
+        if exact_duplicate_exists(question) or similar_previous_question(question):
+            continue
+        if any(question_similarity(question, str(x["question"])) >= 0.84 for x in accepted + valid):
+            continue
+
+        subtopic = normalize(str(item.get("topic", "")))
+        if subtopic_counts.get(subtopic, 0) >= 2:
+            continue
+        subtopic_counts[subtopic] = subtopic_counts.get(subtopic, 0) + 1
+        valid.append(item)
+
+    return valid
+
 
 async def make_ai_contents(
     topic: str,
@@ -1625,10 +969,10 @@ async def make_ai_contents(
     language: str,
     mode: str,
     source_text: str,
-    source_file: Optional[str],
+    source_files: Optional[list[str]],
     history: list[str],
-) -> tuple[Any, bool]:
-
+    already_generated: list[str],
+) -> tuple[str, bool, list[str]]:
     prompt = build_prompt(
         topic=topic,
         count=count,
@@ -1636,160 +980,9 @@ async def make_ai_contents(
         mode=mode,
         source_text=source_text,
         history=history,
+        already_generated=already_generated,
     )
-
-    # AI mode uses search grounding.
-    use_search = mode == "ai"
-
-    if source_file:
-
-        # Gemini Files API directly handles image/PDF multimodal content.
-        uploaded = await asyncio.to_thread(
-            gemini.files.upload,
-            file=source_file,
-        )
-
-        return [
-            prompt,
-            uploaded,
-        ], use_search
-
-    return prompt, use_search
-
-
-# ----------------------------
-# Validation
-# ----------------------------
-
-def valid_question(item: dict[str, Any]) -> bool:
-
-    try:
-        question = str(
-            item.get("question", "")
-        ).strip()
-
-        options = [
-            str(x).strip()
-            for x in item.get("options", [])
-        ]
-
-        idx = int(
-            item.get("correct_index")
-        )
-
-        explanation = str(
-            item.get("explanation", "")
-        ).strip()
-
-        source = str(
-            item.get("source", "")
-        ).strip()
-
-        topic = str(
-            item.get("topic", "")
-        ).strip()
-
-        if not question:
-            return False
-
-        if len(question) > 300:
-            return False
-
-        if len(options) != 4:
-            return False
-
-        if any(
-            not option
-            or len(option) > 100
-            for option in options
-        ):
-            return False
-
-        normalized_options = [
-            normalize(x)
-            for x in options
-        ]
-
-        if len(
-            set(normalized_options)
-        ) != 4:
-            return False
-
-        if idx not in (
-            0,
-            1,
-            2,
-            3,
-        ):
-            return False
-
-        if not explanation:
-            return False
-
-        if len(explanation) > 200:
-            return False
-
-        if not source:
-            return False
-
-        if not topic:
-            return False
-
-        return True
-
-    except Exception:
-        return False
-
-
-def post_validate(
-    raw_questions: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-
-    valid = []
-
-    topic_counts: dict[str, int] = {}
-
-    for item in raw_questions:
-
-        if not valid_question(item):
-            continue
-
-        q = str(
-            item["question"]
-        ).strip()
-
-        if exact_duplicate_exists(q):
-            continue
-
-        # Same-generation duplicate check.
-        q_norm = normalize(q)
-
-        if any(
-            q_norm == normalize(
-                existing["question"]
-            )
-            for existing in valid
-        ):
-            continue
-
-        subtopic = normalize(
-            str(
-                item["topic"]
-            )
-        )
-
-        topic_counts[subtopic] = (
-            topic_counts.get(subtopic, 0)
-            + 1
-        )
-
-        # max 2 per narrow topic in a generation
-        if topic_counts[subtopic] > 2:
-            continue
-
-        valid.append(item)
-
-    return valid
+    return prompt, mode == "ai", list(source_files or [])
 
 
 async def generate_questions(
@@ -1798,220 +991,506 @@ async def generate_questions(
     language: str,
     mode: str,
     source_text: str = "",
-    source_file: Optional[str] = None,
-) -> list[dict[str, Any]]:
+    source_files: Optional[list[str]] = None,
+    progress_callback: Optional[Any] = None,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Return (questions, terminal_error_message).
 
-    generated: list[dict[str, Any]] = []
-    attempts = 0
-    max_attempts = max(3, count * 2)
-
-    while len(generated) < count and attempts < max_attempts:
-
-        attempts += 1
-        remaining = count - len(generated)
-
-        batch_count = min(
-            BATCH_SIZE,
-            remaining,
-        )
-
-        history = (
-            recent_history()
-            + [
-                item["question"]
-                for item in generated
-            ]
-        )
-
-        contents, use_search = await make_ai_contents(
-            topic=topic,
-            count=batch_count,
-            language=language,
-            mode=mode,
-            source_text=source_text,
-            source_file=source_file,
-            history=history,
-        )
-
-        result = await call_ai(
-            contents=contents,
-            use_search=use_search,
-        )
-
-        candidates = result.get(
-            "questions",
-            []
-        )
-
-        if not isinstance(
-            candidates,
-            list,
-        ):
-            break
-
-        validated = post_validate(
-            candidates
-        )
-
-        if not validated:
-            # One regeneration attempt with stronger uniqueness
-            history = (
-                recent_history()
-                + [
-                    item["question"]
-                    for item in generated
-                ]
-                + [
-                    str(
-                        candidate.get(
-                            "question",
-                            ""
-                        )
-                    )
-                    for candidate in candidates
-                ]
-            )
-
-            regeneration_contents, regeneration_search = (
-                await make_ai_contents(
-                    topic=topic,
-                    count=batch_count,
-                    language=language,
-                    mode=mode,
-                    source_text=source_text,
-                    source_file=source_file,
-                    history=history,
-                )
-            )
-
-            result2 = await call_ai(
-                contents=regeneration_contents,
-                use_search=regeneration_search,
-            )
-
-            validated = post_validate(
-                result2.get(
-                    "questions",
-                    []
-                )
-            )
-
-        generated.extend(
-            validated[:remaining]
-        )
-
-        if not validated:
-            break
-
-        if len(generated) >= count:
-            break
-
-    return generated[:count]
-
-
-# ----------------------------
-# Publish quiz
-# ----------------------------
-
-async def publish_quiz(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Generate questions, save them, and wait for the user to choose
-    where/how the quiz should actually start. Questions are NOT published
-    all at once.
+    We deliberately return valid partial output when the provider quota is hit,
+    rather than fabricating or forcing invalid questions.
     """
-
-    topic = context.user_data["topic"]
-    count = context.user_data["question_count"]
-    language = context.user_data["language"]
-    mode = context.user_data["mode"]
-
-    source_text = context.user_data.get("source_text", "")
-    source_file = context.user_data.get("source_file")
-
-    await update.effective_message.reply_text(
-        "â³ Questions generate à¤•à¤¿à¤ à¤œà¤¾ à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚...\n"
-        "Originality, source verification à¤”à¤° duplicate checks à¤šà¤² à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚à¥¤"
-    )
+    generated: list[dict[str, Any]] = []
+    source_files = list(source_files or [])
 
     try:
-        questions = await generate_questions(
+        history = recent_history()
+        batch_size = min(20, count)
+        calls = 0
+        while len(generated) < count and calls < AI_MAX_CALLS_PER_REQUEST:
+            remaining = count - len(generated)
+            requested = min(batch_size, remaining)
+            calls += 1
+
+            if progress_callback:
+                await progress_callback(f"â³ AI question batch {calls} à¤¤à¥ˆà¤¯à¤¾à¤° à¤•à¤° à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦ ({len(generated)}/{count})")
+
+            prompt, use_search, source_files_for_call = await make_ai_contents(
+                topic=topic,
+                count=requested,
+                language=language,
+                mode=mode,
+                source_text=source_text,
+                source_files=source_files,
+                history=history,
+                already_generated=[x["question"] for x in generated],
+            )
+
+            try:
+                result = await call_ai(prompt, use_search, source_files_for_call)
+            except AIQuotaError as exc:
+                logger.warning("Quota hit after %s calls: %s", calls, exc)
+                if generated:
+                    return generated[:count], str(exc)
+                return [], str(exc)
+            except Exception as exc:
+                logger.exception("AI generation call failed.")
+                if generated:
+                    return generated[:count], str(exc)
+                return [], str(exc)
+
+            candidates = result.get("questions", [])
+            if not isinstance(candidates, list):
+                candidates = []
+
+            validated = post_validate(candidates, generated)
+            generated.extend(validated[:remaining])
+            history.extend([str(x["question"]) for x in validated])
+
+            # After the first successful batch, smaller second batches allow the
+            # validator to fill gaps without issuing huge outputs.
+            batch_size = min(12, max(4, remaining))
+            if not validated:
+                # No valid new questions from this call. One more call can try a
+                # stronger prompt, but never spin indefinitely.
+                batch_size = min(8, remaining)
+
+            if progress_callback and generated:
+                await progress_callback(f"âœ… {len(generated)}/{count} valid questions à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆà¤‚â€¦")
+
+            if not candidates:
+                break
+
+        return generated[:count], None
+    finally:
+        for path in source_files:
+            cleanup_file(path)
+
+
+# ============================================================
+# Conversation state helpers
+# ============================================================
+
+STATE_MODE = 0
+STATE_SOURCE_TYPE = 1
+STATE_SOURCE_CONTENT = 2
+STATE_TOPIC = 3
+STATE_COUNT = 4
+STATE_LANGUAGE = 5
+STATE_START_LOCATION = 6
+STATE_TIME = 7
+STATE_GROUP_START_TIME = 8
+
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "ðŸ“š Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
+                )
+            return ConversationHandler.END
+        return await func(update, context)
+    return wrapper
+
+
+# ============================================================
+# /start and workflow
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return ConversationHandler.END
+
+    if not is_admin(user.id):
+        await message.reply_text(
+            "ðŸ“š ECA QUIZ MAKER\n\n"
+            "Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
+        )
+        return ConversationHandler.END
+
+    args = context.args or []
+    if args and args[0].startswith("quiz_"):
+        quiz_id = args[0][5:]
+        with SessionLocal() as session:
+            quiz = session.get(Quiz, quiz_id)
+        if not quiz:
+            await message.reply_text("âŒ à¤¯à¤¹ quiz link valid à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆ à¤¯à¤¾ quiz à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+            return ConversationHandler.END
+
+        context.user_data["prepared_quiz_id"] = quiz_id
+        context.user_data["topic"] = quiz.title
+        context.user_data["question_count"] = quiz.question_count
+        context.user_data["language"] = quiz.language
+
+        # Deep-link into an actual group: ask time there, not in private chat.
+        if message.chat.type in ("group", "supergroup"):
+            context.user_data["run_mode"] = "group"
+            context.user_data["target_chat_id"] = message.chat.id
+            await message.reply_text(
+                "ðŸŽ¯ QUIZ READY\n\n"
+                f"ðŸ“š Topic: {quiz.title}\n"
+                f"ðŸ”¢ Questions: {quiz.question_count}\n"
+                f"ðŸŒ Language: {quiz.language}\n\n"
+                "â±ï¸ à¤¹à¤° question à¤•à¤¾ à¤¸à¤®à¤¯ à¤šà¥à¤¨à¥‡à¤‚:",
+                reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
+            )
+            return STATE_GROUP_START_TIME
+
+        await message.reply_text(
+            "ðŸŽ¯ QUIZ READY\n\n"
+            f"ðŸ“š Topic: {quiz.title}\n"
+            f"ðŸ”¢ Questions: {quiz.question_count}\n"
+            f"ðŸŒ Language: {quiz.language}\n\n"
+            "Quiz à¤…à¤­à¥€ publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥à¤† à¤¹à¥ˆà¥¤ à¤ªà¤¹à¤²à¥‡ à¤¬à¤¤à¤¾à¤‡à¤ à¤‡à¤¸à¥‡ à¤•à¤¹à¤¾à¤ à¤šà¤²à¤¾à¤¨à¤¾ à¤¹à¥ˆ:",
+            reply_markup=ReplyKeyboardMarkup(
+                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+        return STATE_START_LOCATION
+
+    await message.reply_text(
+        "ðŸ“š ETERNAL CIVIL ACADEMY\n"
+        "QUIZ MAKER\n\n"
+        "à¤†à¤ª à¤•à¥à¤¯à¤¾ à¤•à¤°à¤¨à¤¾ à¤šà¤¾à¤¹à¤¤à¥‡ à¤¹à¥ˆà¤‚?",
+        reply_markup=ReplyKeyboardMarkup(
+            MAIN_BUTTONS,
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+    return STATE_MODE
+
+
+async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    choice = update.effective_message.text.strip()
+
+    if choice == "ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡":
+        context.user_data["mode"] = "ai"
+        await update.effective_message.reply_text(
+            "Topic à¤­à¥‡à¤œà¤¿à¤à¥¤\n\n"
+            "AI à¤¸à¥à¤µà¤¯à¤‚ authoritative sources à¤–à¥‹à¤œà¥‡à¤—à¤¾, facts verify à¤•à¤°à¥‡à¤—à¤¾ à¤”à¤° original questions à¤¬à¤¨à¤¾à¤à¤—à¤¾à¥¤"
+        )
+        return STATE_TOPIC
+
+    if choice == "ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾":
+        context.user_data["mode"] = "source"
+        await update.effective_message.reply_text(
+            "Source à¤•à¤¾ à¤ªà¥à¤°à¤•à¤¾à¤° à¤šà¥à¤¨à¥‡à¤‚:",
+            reply_markup=ReplyKeyboardMarkup(
+                SOURCE_TYPE_BUTTONS,
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+        return STATE_SOURCE_TYPE
+
+    await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ à¤¦à¤¿à¤ à¤—à¤ options à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+    return STATE_MODE
+
+
+async def choose_source_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    choice = update.effective_message.text.strip()
+    mapping = {
+        "ðŸ“„ PDF": "pdf",
+        "ðŸ–¼ Photo": "photo",
+        "ðŸ“ Text": "text",
+        "ðŸ“Š Telegram Poll": "poll",
+        "ðŸ”— URL": "url",
+    }
+    source_type = mapping.get(choice)
+    if not source_type:
+        await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ source type à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        return STATE_SOURCE_TYPE
+
+    context.user_data["source_type"] = source_type
+    if source_type == "text":
+        await update.effective_message.reply_text("à¤…à¤¬ source text à¤­à¥‡à¤œà¤¿à¤à¥¤")
+    elif source_type == "url":
+        await update.effective_message.reply_text("à¤…à¤¬ accessible webpage à¤•à¤¾ URL à¤­à¥‡à¤œà¤¿à¤à¥¤")
+    elif source_type == "poll":
+        await update.effective_message.reply_text(
+            "à¤…à¤¬ Telegram Poll forward/send à¤•à¤°à¥‡à¤‚à¥¤ à¤à¤• à¤¸à¥‡ à¤…à¤§à¤¿à¤• Poll à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚; à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+    elif source_type == "pdf":
+        await update.effective_message.reply_text(
+            "à¤…à¤¬ PDF à¤­à¥‡à¤œà¤¿à¤à¥¤ à¤à¤• à¤¸à¥‡ à¤…à¤§à¤¿à¤• PDF/page files à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚; à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+    else:
+        await update.effective_message.reply_text(
+            "à¤…à¤¬ clear page/photo à¤­à¥‡à¤œà¤¿à¤à¥¤ à¤à¤• à¤¸à¥‡ à¤…à¤§à¤¿à¤• pages à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚; à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+    return STATE_SOURCE_CONTENT
+
+
+async def receive_source_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    text = update.effective_message.text.strip()
+    source_type = context.user_data.get("source_type")
+
+    if source_type in ("pdf", "photo", "poll"):
+        if text == "âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ":
+            if source_type in ("pdf", "photo") and not context.user_data.get("source_files"):
+                await update.effective_message.reply_text("âŒ à¤ªà¤¹à¤²à¥‡ à¤•à¤®-à¤¸à¥‡-à¤•à¤® à¤à¤• file à¤­à¥‡à¤œà¤¿à¤à¥¤")
+                return STATE_SOURCE_CONTENT
+            if source_type == "poll" and not context.user_data.get("source_text"):
+                await update.effective_message.reply_text("âŒ à¤ªà¤¹à¤²à¥‡ à¤•à¤®-à¤¸à¥‡-à¤•à¤® à¤à¤• Telegram Poll à¤­à¥‡à¤œà¤¿à¤à¥¤")
+                return STATE_SOURCE_CONTENT
+            await update.effective_message.reply_text("à¤…à¤¬ Topic à¤­à¥‡à¤œà¤¿à¤à¥¤", reply_markup=ReplyKeyboardRemove())
+            return STATE_TOPIC
+        await update.effective_message.reply_text("Source files/polls à¤­à¥‡à¤œà¤¤à¥‡ à¤°à¤¹à¥‡à¤‚à¥¤ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤")
+        return STATE_SOURCE_CONTENT
+
+    if source_type == "url":
+        if not re.match(r"^https?://", text, flags=re.I):
+            await update.effective_message.reply_text("âŒ Valid http/https URL à¤­à¥‡à¤œà¤¿à¤à¥¤")
+            return STATE_SOURCE_CONTENT
+        await update.effective_message.reply_text("â³ URL content à¤ªà¤¢à¤¼à¤¾ à¤œà¤¾ à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦")
+        try:
+            content = await asyncio.to_thread(fetch_url_text, text)
+        except Exception as exc:
+            logger.exception("URL fetch failed.")
+            await update.effective_message.reply_text(f"âŒ URL read à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\nà¤•à¤¾à¤°à¤£: {str(exc)[:500]}")
+            return STATE_SOURCE_CONTENT
+        context.user_data["source_text"] = content
+        context.user_data["source_summary"] = text
+        await update.effective_message.reply_text("à¤…à¤¬ Topic à¤­à¥‡à¤œà¤¿à¤à¥¤", reply_markup=ReplyKeyboardRemove())
+        return STATE_TOPIC
+
+    # plain text source
+    if len(text) < 20:
+        await update.effective_message.reply_text("âŒ Source à¤¬à¤¹à¥à¤¤ à¤›à¥‹à¤Ÿà¤¾ à¤¹à¥ˆà¥¤ à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• source material à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        return STATE_SOURCE_CONTENT
+    context.user_data["source_text"] = text[:MAX_SOURCE_TEXT]
+    context.user_data["source_summary"] = "User-supplied text"
+    await update.effective_message.reply_text("à¤…à¤¬ Topic à¤­à¥‡à¤œà¤¿à¤à¥¤", reply_markup=ReplyKeyboardRemove())
+    return STATE_TOPIC
+
+
+async def receive_source_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    source_type = context.user_data.get("source_type")
+
+    if source_type == "poll" and update.effective_message.poll:
+        poll: Poll = update.effective_message.poll
+        options = [x.text for x in poll.options]
+        correct_index = getattr(poll, "correct_option_id", None)
+        explanation = getattr(poll, "explanation", None)
+        parts = [f"Question: {poll.question}", "", "Options:"]
+        parts.extend(f"{chr(65+i)}. {opt}" for i, opt in enumerate(options))
+        if correct_index is not None:
+            parts.append(f"Available correct option: {chr(65 + correct_index)}")
+        if explanation:
+            parts.append(f"Explanation: {explanation}")
+        old = context.user_data.get("source_text", "")
+        joined = (old + "\n\n--- Telegram Poll Source ---\n" + "\n".join(parts)).strip()
+        context.user_data["source_text"] = joined[:MAX_SOURCE_TEXT]
+        context.user_data["source_summary"] = "One or more Telegram Poll sources"
+        await update.effective_message.reply_text(
+            "âœ… Poll source received.\n\nà¤”à¤° Poll à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚à¥¤ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
+            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return STATE_SOURCE_CONTENT
+
+    if source_type == "pdf":
+        if not update.effective_message.document or (Path(update.effective_message.document.file_name or "").suffix.lower() != ".pdf"):
+            await update.effective_message.reply_text("âŒ PDF mode à¤®à¥‡à¤‚ à¤•à¥‡à¤µà¤² PDF file à¤­à¥‡à¤œà¤¿à¤à¥¤")
+            return STATE_SOURCE_CONTENT
+    elif source_type == "photo":
+        if not update.effective_message.photo:
+            await update.effective_message.reply_text("âŒ Photo mode à¤®à¥‡à¤‚ image à¤­à¥‡à¤œà¤¿à¤à¥¤")
+            return STATE_SOURCE_CONTENT
+    else:
+        await update.effective_message.reply_text("âŒ à¤¸à¤¹à¥€ source à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        return STATE_SOURCE_CONTENT
+
+    try:
+        path, suffix = await download_message_file(update, context)
+    except Exception:
+        logger.exception("File download failed.")
+        await update.effective_message.reply_text("âŒ File receive à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¥€à¥¤")
+        return STATE_SOURCE_CONTENT
+
+    paths = context.user_data.setdefault("source_files", [])
+    paths.append(path)
+    context.user_data["source_summary"] = f"{len(paths)} {source_type} source file(s)"
+    await update.effective_message.reply_text(
+        f"âœ… File {len(paths)} receive à¤¹à¥‹ à¤—à¤ˆà¥¤\n\nà¤”à¤° pages/files à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚à¥¤ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
+        reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+    )
+    return STATE_SOURCE_CONTENT
+
+
+async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    topic = update.effective_message.text.strip()
+    if len(topic) < 2:
+        await update.effective_message.reply_text("âŒ Valid Topic à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        return STATE_TOPIC
+    context.user_data["topic"] = topic
+    await update.effective_message.reply_text("à¤•à¤¿à¤¤à¤¨à¥‡ Questions à¤šà¤¾à¤¹à¤¿à¤?\n\n1 à¤¸à¥‡ 100 à¤•à¥‡ à¤¬à¥€à¤š à¤¸à¤‚à¤–à¥à¤¯à¤¾ à¤­à¥‡à¤œà¤¿à¤à¥¤")
+    return STATE_COUNT
+
+
+async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        count = int(update.effective_message.text.strip())
+    except ValueError:
+        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² à¤¸à¤‚à¤–à¥à¤¯à¤¾ à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        return STATE_COUNT
+    if not 1 <= count <= MAX_QUESTIONS:
+        await update.effective_message.reply_text(f"âŒ à¤¸à¤‚à¤–à¥à¤¯à¤¾ 1 à¤¸à¥‡ {MAX_QUESTIONS} à¤•à¥‡ à¤¬à¥€à¤š à¤¹à¥‹à¤¨à¥€ à¤šà¤¾à¤¹à¤¿à¤à¥¤")
+        return STATE_COUNT
+    context.user_data["question_count"] = count
+    await update.effective_message.reply_text(
+        "Language à¤šà¥à¤¨à¥‡à¤‚:",
+        reply_markup=ReplyKeyboardMarkup(LANGUAGE_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return STATE_LANGUAGE
+
+
+async def receive_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    language = LANGUAGE_LABELS.get(update.effective_message.text.strip())
+    if not language:
+        await update.effective_message.reply_text("à¤¹à¤¿à¤‚à¤¦à¥€, English à¤¯à¤¾ à¤¦à¥à¤µà¤¿à¤­à¤¾à¤·à¥€ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        return STATE_LANGUAGE
+    context.user_data["language"] = language
+    return await prepare_quiz(update, context)
+
+
+# ============================================================
+# Prepare quiz, but do not publish questions
+# ============================================================
+
+async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    message = update.effective_message
+    topic = context.user_data.get("topic", "")
+    count = int(context.user_data.get("question_count", 0))
+    language = context.user_data.get("language", "")
+    mode = context.user_data.get("mode", "ai")
+    source_text = context.user_data.get("source_text", "")
+    source_files = list(context.user_data.get("source_files", []))
+
+    status = await message.reply_text(
+        "â³ Quiz à¤¤à¥ˆà¤¯à¤¾à¤° à¤•à¤¿à¤¯à¤¾ à¤œà¤¾ à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦\n"
+        "Questions à¤…à¤­à¥€ publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹à¤‚à¤—à¥‡à¥¤\n\n"
+        "AI source verification + originality + duplicate checks à¤šà¤² à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚â€¦"
+    )
+
+    async def progress(text: str) -> None:
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
+
+    try:
+        questions, terminal_error = await generate_questions(
             topic=topic,
             count=count,
             language=language,
             mode=mode,
             source_text=source_text,
-            source_file=source_file,
+            source_files=source_files,
+            progress_callback=progress,
         )
 
         if not questions:
-            await update.effective_message.reply_text(
-                "âŒ à¤‡à¤¸ request à¤ªà¤° à¤•à¥‹à¤ˆ valid question à¤¤à¥ˆà¤¯à¤¾à¤° à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\n"
-                "Topic/source à¤•à¥‹ à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• specific à¤•à¤°à¤•à¥‡ à¤«à¤¿à¤° à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤"
-            )
-            return
+            if terminal_error and "quota" in terminal_error.lower():
+                await status.edit_text(
+                    "âŒ à¤…à¤­à¥€ AI quota à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤\n\n"
+                    "à¤¸à¤­à¥€ configured Gemini models/keys à¤¨à¥‡ quota/rate-limit error à¤¦à¤¿à¤¯à¤¾à¥¤\n"
+                    "à¤‡à¤¸ bot à¤¨à¥‡ fake/unchecked questions à¤¬à¤¨à¤¾à¤•à¤° à¤†à¤—à¥‡ à¤¨à¤¹à¥€à¤‚ à¤¬à¤¢à¤¼à¤¾à¤¯à¤¾à¥¤"
+                )
+            else:
+                await status.edit_text(
+                    "âŒ à¤•à¥‹à¤ˆ valid question à¤¤à¥ˆà¤¯à¤¾à¤° à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\n"
+                    "Question quality/verification pass à¤¨à¤¹à¥€à¤‚ à¤¹à¥à¤ˆ, à¤‡à¤¸à¤²à¤¿à¤ quiz publish à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤—à¤¯à¤¾à¥¤\n"
+                    "Topic/source à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• specific à¤•à¤°à¤•à¥‡ à¤«à¤¿à¤° à¤ªà¥à¤°à¤¯à¤¾à¤¸ à¤•à¤°à¥‡à¤‚à¥¤"
+                )
+            return ConversationHandler.END
 
-        quiz_id = (
-            f"eca-{int(datetime.now().timestamp())}-"
-            f"{update.effective_user.id}"
-        )
-
-        closes_at = datetime.now(timezone.utc) + timedelta(
-            minutes=max(5, len(questions) * 5)
-        )
-
+        quiz_id = f"eca-{uuid.uuid4().hex[:24]}"
+        source_summary = str(context.user_data.get("source_summary", ""))[:5000]
         with SessionLocal() as session:
             session.add(
                 Quiz(
                     id=quiz_id,
-                    chat_id=update.effective_chat.id,
-                    created_by=update.effective_user.id,
+                    created_by=user.id,
                     title=topic,
                     question_count=len(questions),
                     language=language,
-                    created_at=datetime.now(timezone.utc),
-                    closes_at=closes_at,
-                    leaderboard_sent=False,
+                    source_mode=mode,
+                    source_summary=source_summary,
                 )
             )
-
-            for index, item in enumerate(questions, start=1):
+            for idx, item in enumerate(questions, 1):
                 session.add(
                     QuizQuestion(
                         quiz_id=quiz_id,
-                        question_no=index,
+                        question_no=idx,
                         question_text=item["question"],
-                        options_json=json.dumps(
-                            item["options"],
-                            ensure_ascii=False,
-                        ),
-                        correct_index=item["correct_index"],
+                        options_json=json.dumps(item["options"], ensure_ascii=False),
+                        correct_index=int(item["correct_index"]),
                         explanation=item["explanation"],
                         source=item["source"],
                     )
                 )
-
             session.commit()
+
+        for item in questions:
+            try:
+                save_history(item)
+            except Exception:
+                logger.exception("Question history save failed for a generated question.")
 
         context.user_data["prepared_quiz_id"] = quiz_id
 
-        me = await context.bot.get_me()
-        personal_link = (
-            f"https://t.me/{me.username}?start=quiz_{quiz_id}"
-        )
+        bot = await context.bot.get_me()
+        personal_link = f"https://t.me/{bot.username}?start=quiz_{quiz_id}"
 
-        await update.effective_message.reply_text(
+        partial = ""
+        if len(questions) < count:
+            partial = (
+                f"\n\nâš ï¸ Requested: {count}\n"
+                f"âœ… Verified/valid: {len(questions)}\n"
+                "à¤•à¤® à¤ªà¥à¤°à¤¶à¥à¤¨ à¤‡à¤¸à¤²à¤¿à¤ à¤°à¤–à¥‡ à¤—à¤ à¤¹à¥ˆà¤‚ à¤•à¥à¤¯à¥‹à¤‚à¤•à¤¿ quality/verification à¤•à¥‹ bypass à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤—à¤¯à¤¾à¥¤"
+            )
+            if terminal_error and "quota" in terminal_error.lower():
+                partial += "\n\nGemini quota à¤¨à¥‡ à¤†à¤—à¥‡ generation à¤°à¥‹à¤• à¤¦à¥€à¥¤"
+
+        await status.edit_text(
             "âœ… QUIZ READY\n\n"
             f"ðŸ“š Topic: {topic}\n"
             f"ðŸ”¢ Questions: {len(questions)}\n"
-            f"ðŸŒ Language: {language}\n\n"
-            "à¤…à¤­à¥€ questions Telegram à¤ªà¤° à¤à¤• à¤¸à¤¾à¤¥ à¤¨à¤¹à¥€à¤‚ à¤­à¥‡à¤œà¥‡ à¤—à¤ à¤¹à¥ˆà¤‚à¥¤\n"
+            f"ðŸŒ Language: {language}"
+            f"{partial}\n\n"
+            "Questions à¤…à¤­à¥€ à¤à¤• à¤¸à¤¾à¤¥ Telegram à¤ªà¤° à¤¨à¤¹à¥€à¤‚ à¤­à¥‡à¤œà¥‡ à¤—à¤ à¤¹à¥ˆà¤‚à¥¤\n"
             "à¤ªà¤¹à¤²à¥‡ Start Location à¤”à¤° à¤«à¤¿à¤° à¤ªà¥à¤°à¤¤à¤¿-question time à¤šà¥à¤¨à¤¨à¤¾ à¤¹à¥‹à¤—à¤¾à¥¤\n\n"
-            f"ðŸ”— Quiz link:\n{personal_link}"
+            f"ðŸ”— Prepared Quiz Link:\n{personal_link}"
         )
 
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "ðŸ“ Quiz à¤•à¤¹à¤¾à¤ à¤¶à¥à¤°à¥‚ à¤•à¤°à¤¨à¤¾ à¤¹à¥ˆ?",
             reply_markup=ReplyKeyboardMarkup(
                 [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
@@ -2019,150 +1498,125 @@ async def publish_quiz(
                 one_time_keyboard=True,
             ),
         )
-
+        return STATE_START_LOCATION
     except Exception:
         logger.exception("Quiz preparation failed.")
-        await update.effective_message.reply_text(
-            "âŒ Quiz preparation à¤®à¥‡à¤‚ error à¤†à¤¯à¤¾à¥¤\n"
-            "Render logs à¤®à¥‡à¤‚ à¤ªà¥‚à¤°à¤¾ technical error à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
-        )
+        await status.edit_text("âŒ Quiz preparation à¤®à¥‡à¤‚ unexpected error à¤†à¤¯à¤¾à¥¤ Logs à¤®à¥‡à¤‚ technical details à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¤‚à¥¤")
+        return ConversationHandler.END
     finally:
-        cleanup_file(source_file)
+        # generate_questions() itself cleans the source file.
+        context.user_data.pop("source_files", None)
 
 
-async def choose_start_location(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
+# ============================================================
+# Start location / timer
+# ============================================================
+
+async def choose_start_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     choice = update.effective_message.text.strip()
     quiz_id = context.user_data.get("prepared_quiz_id")
-
     if not quiz_id:
-        await update.effective_message.reply_text(
-            "âŒ à¤•à¥‹à¤ˆ prepared quiz à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤"
-        )
+        await update.effective_message.reply_text("âŒ Prepared quiz à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤")
         return ConversationHandler.END
 
     if choice == "ðŸ‘¤ Personally":
         if update.effective_chat.type != "private":
-            await update.effective_message.reply_text(
-                "âŒ Personal mode à¤•à¥‡ à¤²à¤¿à¤ bot à¤•à¥€ private chat à¤®à¥‡à¤‚ quiz start à¤•à¤°à¥‡à¤‚à¥¤\n"
-                "à¤‡à¤¸ chat à¤®à¥‡à¤‚ Group mode à¤šà¥à¤¨à¥‡à¤‚à¥¤"
-            )
-            return 7
-
+            await update.effective_message.reply_text("âŒ Personal mode à¤•à¥‡à¤µà¤² bot à¤•à¥€ private chat à¤®à¥‡à¤‚ à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤")
+            return STATE_START_LOCATION
         context.user_data["run_mode"] = "personal"
         context.user_data["target_chat_id"] = update.effective_chat.id
 
-    elif choice == "ðŸ‘¥ Group":
+        await update.effective_message.reply_text(
+            "â±ï¸ à¤à¤• question à¤•à¤¿à¤¤à¤¨à¥‡ à¤¸à¤®à¤¯ à¤¤à¤• à¤šà¤²à¥‡?\n\n"
+            "à¤¸à¤®à¤¯ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¤à¥‡ à¤¹à¥€ à¤…à¤—à¤²à¤¾ question à¤…à¤ªà¤¨à¥‡-à¤†à¤ª à¤†à¤à¤—à¤¾à¥¤",
+            reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
+        )
+        return STATE_TIME
+
+    if choice == "ðŸ‘¥ Group":
         if update.effective_chat.type in ("group", "supergroup"):
             context.user_data["run_mode"] = "group"
             context.user_data["target_chat_id"] = update.effective_chat.id
-        else:
-            context.user_data["run_mode"] = "group"
-            context.user_data["target_chat_id"] = None
-
-            me = await context.bot.get_me()
-            group_link = (
-                f"https://t.me/{me.username}?startgroup=quiz_{quiz_id}"
-            )
-
             await update.effective_message.reply_text(
-                "ðŸ‘¥ Group mode selected.\n\n"
-                "à¤œà¤¿à¤¸ Telegram group à¤®à¥‡à¤‚ quiz à¤šà¤²à¤¾à¤¨à¤¾ à¤¹à¥ˆ, à¤‰à¤¸à¤®à¥‡à¤‚ bot à¤•à¥‹ add à¤•à¤°à¥‡à¤‚ "
-                "à¤”à¤° à¤µà¤¹à¥€à¤‚ à¤‡à¤¸ quiz à¤•à¥‹ start à¤•à¤°à¥‡à¤‚à¥¤\n\n"
-                f"ðŸ”— Group start link:\n{group_link}\n\n"
-                "à¤¯à¤¾ group à¤®à¥‡à¤‚ bot à¤•à¥‹ add à¤•à¤°à¤•à¥‡ à¤­à¥‡à¤œà¥‡à¤‚:\n"
-                f"/start quiz_{quiz_id}"
+                "â±ï¸ à¤à¤• question à¤•à¤¿à¤¤à¤¨à¥‡ à¤¸à¤®à¤¯ à¤¤à¤• à¤šà¤²à¥‡?",
+                reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
             )
+            return STATE_TIME
 
-            return 7
-    else:
+        bot = await context.bot.get_me()
+        group_link = f"https://t.me/{bot.username}?startgroup=quiz_{quiz_id}"
         await update.effective_message.reply_text(
-            "à¤•à¥ƒà¤ªà¤¯à¤¾ Personally à¤¯à¤¾ Group à¤šà¥à¤¨à¥‡à¤‚à¥¤"
+            "ðŸ‘¥ Group mode selected.\n\n"
+            "à¤œà¤¿à¤¸ group à¤®à¥‡à¤‚ quiz à¤šà¤²à¤¾à¤¨à¤¾ à¤¹à¥ˆ, à¤µà¤¹à¤¾à¤ bot à¤•à¥‹ add à¤•à¤°à¥‡à¤‚ à¤”à¤° à¤¨à¥€à¤šà¥‡ à¤µà¤¾à¤²à¤¾ link à¤‡à¤¸à¥à¤¤à¥‡à¤®à¤¾à¤² à¤•à¤°à¥‡à¤‚à¥¤\n\n"
+            f"ðŸ”— Group Start Link:\n{group_link}\n\n"
+            "Group à¤®à¥‡à¤‚ quiz à¤¶à¥à¤°à¥‚ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° à¤µà¤¹à¥€à¤‚ timer à¤ªà¥‚à¤›à¤¾ à¤œà¤¾à¤à¤—à¤¾à¥¤",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        return 7
+        return ConversationHandler.END
 
-    await update.effective_message.reply_text(
-        "â±ï¸ à¤à¤• question à¤•à¤¿à¤¤à¤¨à¥‡ à¤¸à¤®à¤¯ à¤¤à¤• à¤šà¤²à¥‡?\n\n"
-        "à¤¸à¤®à¤¯ à¤¹à¤° question à¤ªà¤° à¤²à¤¾à¤—à¥‚ à¤¹à¥‹à¤—à¤¾ à¤”à¤° à¤¸à¤®à¤¯ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¤à¥‡ à¤¹à¥€ à¤…à¤—à¤²à¤¾ question "
-        "à¤…à¤ªà¤¨à¥‡-à¤†à¤ª à¤†à¤à¤—à¤¾à¥¤",
-        reply_markup=ReplyKeyboardMarkup(
-            [
-                ["15 à¤¸à¥‡à¤•à¤‚à¤¡", "25 à¤¸à¥‡à¤•à¤‚à¤¡"],
-                ["30 à¤¸à¥‡à¤•à¤‚à¤¡", "1 à¤®à¤¿à¤¨à¤Ÿ"],
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
-    return 8
+    await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ Personally à¤¯à¤¾ Group à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+    return STATE_START_LOCATION
 
 
-async def choose_question_time(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
+async def choose_question_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
-    mapping = {
-        "15 à¤¸à¥‡à¤•à¤‚à¤¡": 15,
-        "25 à¤¸à¥‡à¤•à¤‚à¤¡": 25,
-        "30 à¤¸à¥‡à¤•à¤‚à¤¡": 30,
-        "1 à¤®à¤¿à¤¨à¤Ÿ": 60,
-    }
-
-    choice = update.effective_message.text.strip()
-    seconds = mapping.get(choice)
-
+    seconds = TIME_OPTIONS.get(update.effective_message.text.strip())
     if not seconds:
-        await update.effective_message.reply_text(
-            "à¤•à¥ƒà¤ªà¤¯à¤¾ 15, 25, 30 à¤¸à¥‡à¤•à¤‚à¤¡ à¤¯à¤¾ 1 à¤®à¤¿à¤¨à¤Ÿ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤"
-        )
-        return 8
+        await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ 15, 25, 30 à¤¸à¥‡à¤•à¤‚à¤¡ à¤¯à¤¾ 1 à¤®à¤¿à¤¨à¤Ÿ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        return STATE_TIME
 
+    return await start_run_after_timer(update, context, seconds)
+
+
+async def choose_group_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    seconds = TIME_OPTIONS.get(update.effective_message.text.strip())
+    if not seconds:
+        await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ 15, 25, 30 à¤¸à¥‡à¤•à¤‚à¤¡ à¤¯à¤¾ 1 à¤®à¤¿à¤¨à¤Ÿ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        return STATE_GROUP_START_TIME
+    return await start_run_after_timer(update, context, seconds)
+
+
+async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TYPE, seconds: int) -> int:
     quiz_id = context.user_data.get("prepared_quiz_id")
     mode = context.user_data.get("run_mode")
     target_chat_id = context.user_data.get("target_chat_id")
 
-    if not quiz_id:
-        await update.effective_message.reply_text(
-            "âŒ Quiz session à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤"
-        )
+    if not quiz_id or mode not in ("personal", "group") or not target_chat_id:
+        await update.effective_message.reply_text("âŒ Quiz run details à¤…à¤§à¥‚à¤°à¥‡ à¤¹à¥ˆà¤‚à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤")
         return ConversationHandler.END
 
-    if mode == "group" and not target_chat_id:
-        await update.effective_message.reply_text(
-            "âŒ Group chat select à¤¨à¤¹à¥€à¤‚ à¤¹à¥à¤†à¥¤ à¤Šà¤ªà¤° à¤¦à¤¿à¤ Group start link à¤¸à¥‡ "
-            "group à¤®à¥‡à¤‚ quiz à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤"
-        )
+    # Make sure quiz still exists and has questions.
+    with SessionLocal() as session:
+        quiz = session.get(Quiz, quiz_id)
+        q_count = session.scalar(select(QuizQuestion.id).where(QuizQuestion.quiz_id == quiz_id).limit(1))
+    if not quiz or q_count is None:
+        await update.effective_message.reply_text("âŒ à¤¯à¤¹ prepared quiz à¤…à¤¬ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
         return ConversationHandler.END
 
-    if mode == "personal":
-        target_chat_id = update.effective_chat.id
-
-    run_id = f"{quiz_id}-run-{int(datetime.now().timestamp())}-{update.effective_user.id}"
-
+    run_id = f"{quiz_id}-run-{uuid.uuid4().hex[:18]}"
     with SessionLocal() as session:
         session.add(
             QuizRun(
                 id=run_id,
                 quiz_id=quiz_id,
-                target_chat_id=target_chat_id,
+                target_chat_id=int(target_chat_id),
                 started_by=update.effective_user.id,
                 mode=mode,
                 interval_seconds=seconds,
                 current_question=0,
                 active=True,
+                started_at=datetime.now(timezone.utc),
+                leaderboard_sent=False,
             )
         )
         session.commit()
-
-    context.user_data.clear()
 
     await update.effective_message.reply_text(
         "ðŸš€ QUIZ STARTING\n\n"
@@ -2172,366 +1626,267 @@ async def choose_question_time(
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    await send_next_question(context, run_id)
-
+    context.user_data.clear()
+    try:
+        await send_next_question(context, run_id)
+    except Exception:
+        logger.exception("Initial quiz question failed for run=%s", run_id)
+        await update.effective_message.reply_text("âŒ Quiz start à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤")
     return ConversationHandler.END
 
 
-async def send_next_question(
-    context: ContextTypes.DEFAULT_TYPE,
-    run_id: str,
-) -> None:
-    """Send exactly one question, then schedule the next one."""
+# ============================================================
+# One-question-at-a-time scheduler
+# ============================================================
 
+async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) -> None:
     with SessionLocal() as session:
         run = session.get(QuizRun, run_id)
         if not run or not run.active:
             return
-
         quiz = session.get(Quiz, run.quiz_id)
         if not quiz:
             run.active = False
             session.commit()
             return
 
-        question_no = run.current_question + 1
-
+        next_no = run.current_question + 1
         question = session.scalar(
             select(QuizQuestion)
-            .where(
-                QuizQuestion.quiz_id == run.quiz_id,
-                QuizQuestion.question_no == question_no,
-            )
+            .where(QuizQuestion.quiz_id == run.quiz_id, QuizQuestion.question_no == next_no)
+            .limit(1)
         )
 
         if not question:
             run.active = False
+            run.completed_at = datetime.now(timezone.utc)
             session.commit()
-            quiz.leaderboard_sent = False
-            session.commit()
-
-            text = await asyncio.to_thread(
-                build_leaderboard,
-                run.quiz_id,
+            # Finish outside DB transaction.
+            target_chat_id = run.target_chat_id
+            completed_text = await asyncio.to_thread(build_leaderboard, run_id)
+            await safe_send_message(
+                context.bot,
+                target_chat_id,
+                "ðŸ QUIZ COMPLETED\n\n"
+                "à¤¸à¤­à¥€ questions à¤ªà¥‚à¤°à¥‡ à¤¹à¥‹ à¤—à¤à¥¤\n\n"
+                f"{completed_text}",
             )
-
-            try:
-                await context.bot.send_message(
-                    chat_id=run.target_chat_id,
-                    text=(
-                        "ðŸ QUIZ COMPLETED\n\n"
-                        "à¤¸à¤­à¥€ questions à¤ªà¥‚à¤°à¥‡ à¤¹à¥‹ à¤—à¤à¥¤\n\n"
-                        + text[:3500]
-                    ),
-                )
-            except Exception:
-                logger.exception("Could not send completion message.")
             return
 
         options = json.loads(question.options_json)
-
-        try:
-            message = await context.bot.send_poll(
-                chat_id=run.target_chat_id,
-                question=question.question_text[:300],
-                options=[x[:100] for x in options],
-                type="quiz",
-                is_anonymous=False,
-                allows_multiple_answers=False,
-                correct_option_id=question.correct_index,
-                explanation=question.explanation[:200],
-                description=(
-                    f"ðŸ“š ECA Quiz\n"
-                    f"Question {question_no}\n\n"
-                    f"{SOURCE_FOOTER}"
-                )[:1024],
-                open_period=run.interval_seconds,
-            )
-
-            if not message.poll:
-                raise RuntimeError("Telegram did not return a Poll object.")
-
-            session.add(
-                QuizPoll(
-                    quiz_id=run.quiz_id,
-                    poll_id=message.poll.id,
-                    question_no=question_no,
-                    correct_index=question.correct_index,
-                    question_text=question.question_text,
-                )
-            )
-            run.current_question = question_no
-            session.commit()
-
-            save_history(
-                {
-                    "question": question.question_text,
-                    "topic": quiz.title,
-                },
-                question.source,
-            )
-
-        except Exception:
-            logger.exception(
-                "Could not publish question %s for run %s",
-                question_no,
-                run_id,
-            )
-
+        if not isinstance(options, list) or len(options) != 4:
             run.active = False
             session.commit()
-
-            await context.bot.send_message(
-                chat_id=run.target_chat_id,
-                text=(
-                    f"âŒ Question {question_no} publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n"
-                    "Quiz à¤°à¥‹à¤• à¤¦à¤¿à¤¯à¤¾ à¤—à¤¯à¤¾ à¤¹à¥ˆà¥¤"
-                ),
+            await safe_send_message(
+                context.bot,
+                run.target_chat_id,
+                f"âŒ Question {next_no} publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾ à¤•à¥à¤¯à¥‹à¤‚à¤•à¤¿ stored options invalid à¤¹à¥ˆà¤‚à¥¤",
             )
             return
 
-        # Schedule the next question exactly after the selected interval.
-        if context.job_queue:
-            context.job_queue.run_once(
-                send_next_question_job,
-                when=run.interval_seconds,
-                data={"run_id": run_id},
-                name=f"next-{run_id}-{question_no}",
-            )
+        now = datetime.now(timezone.utc)
+        closes = now + timedelta(seconds=run.interval_seconds)
+        target = run.target_chat_id
+        interval = run.interval_seconds
+        correct_index = question.correct_index
+        explanation = question.explanation
+        question_text = question.question_text
+        topic = quiz.title
 
-
-async def send_next_question_job(
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    job = context.job
-    if not job or not job.data:
+    try:
+        message = await context.bot.send_poll(
+            chat_id=target,
+            question=question_text[:300],
+            options=[str(x)[:100] for x in options],
+            type="quiz",
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            allows_revoting=False,
+            correct_option_id=correct_index,
+            explanation=explanation[:200],
+            description=(
+                f"ðŸ“š ECA QUIZ | {topic}\n"
+                f"Question {next_no}\n\n"
+                f"{SOURCE_FOOTER}"
+            )[:1024],
+            open_period=interval,
+        )
+    except (RetryAfter, TimedOut, NetworkError) as exc:
+        logger.warning("Telegram transient send_poll failure run=%s: %s", run_id, exc)
+        # Retry once after RetryAfter-provided delay if available.
+        delay = float(getattr(exc, "retry_after", 2)) if isinstance(exc, RetryAfter) else 2.0
+        await asyncio.sleep(min(delay, 10.0))
+        message = await context.bot.send_poll(
+            chat_id=target,
+            question=question_text[:300],
+            options=[str(x)[:100] for x in options],
+            type="quiz",
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            allows_revoting=False,
+            correct_option_id=correct_index,
+            explanation=explanation[:200],
+            description=(
+                f"ðŸ“š ECA QUIZ | {topic}\n"
+                f"Question {next_no}\n\n"
+                f"{SOURCE_FOOTER}"
+            )[:1024],
+            open_period=interval,
+        )
+    except (Forbidden, BadRequest) as exc:
+        logger.exception("Telegram rejected poll for run=%s", run_id)
+        with SessionLocal() as session:
+            run = session.get(QuizRun, run_id)
+            if run:
+                run.active = False
+                session.commit()
+        await safe_send_message(
+            context.bot,
+            target,
+            "âŒ Telegram à¤¨à¥‡ quiz poll publish à¤•à¤°à¤¨à¥‡ à¤¸à¥‡ à¤®à¤¨à¤¾ à¤•à¤° à¤¦à¤¿à¤¯à¤¾à¥¤\n\n"
+            "Group à¤®à¥‡à¤‚ bot à¤•à¥‹ à¤¸à¤¹à¥€ permissions à¤¦à¥‡à¤‚, à¤¯à¤¾ Personal mode à¤®à¥‡à¤‚ à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤",
+        )
         return
 
-    await send_next_question(
-        context,
-        job.data["run_id"],
-    )
-
-
-# ----------------------------
-# Poll answer tracking
-# ----------------------------
-
-async def poll_answer_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-
-    answer = update.poll_answer
-
-    if not answer or not answer.option_ids:
-        return
-
-    selected_index = answer.option_ids[0]
+    if not message.poll:
+        raise RuntimeError("Telegram send_poll succeeded but returned no Poll object.")
 
     with SessionLocal() as session:
-
-        poll_row = session.scalar(
-            select(QuizPoll)
-            .where(
-                QuizPoll.poll_id == answer.poll_id
+        run = session.get(QuizRun, run_id)
+        if not run or not run.active:
+            return
+        session.add(
+            QuizPoll(
+                run_id=run_id,
+                quiz_id=run.quiz_id,
+                poll_id=message.poll.id,
+                question_no=next_no,
+                correct_index=correct_index,
+                question_text=question_text,
+                opened_at=now,
+                closes_at=closes,
             )
         )
+        run.current_question = next_no
+        session.commit()
 
+    if context.job_queue:
+        context.job_queue.run_once(
+            send_next_question_job,
+            when=interval + 0.5,
+            data={"run_id": run_id},
+            name=f"eca-next-{run_id}-{next_no}",
+        )
+
+
+async def send_next_question_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data if context.job else None
+    if not data:
+        return
+    await send_next_question(context, str(data["run_id"]))
+
+
+# ============================================================
+# Poll answers / leaderboard
+# ============================================================
+
+async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    answer = update.poll_answer
+    if not answer or not answer.user:
+        return
+    # Empty option_ids means vote was retracted. Since revoting is disabled,
+    # simply ignore it.
+    if not answer.option_ids:
+        return
+    selected_index = int(answer.option_ids[0])
+
+    with SessionLocal() as session:
+        poll_row = session.scalar(select(QuizPoll).where(QuizPoll.poll_id == answer.poll_id).limit(1))
         if not poll_row:
             return
-
-        if not is_poll_open(
-            session,
-            poll_row.quiz_id,
-        ):
+        now = datetime.now(timezone.utc)
+        if now > poll_row.closes_at:
             return
 
+        is_correct = selected_index == poll_row.correct_index
         user = answer.user
-
-        user_name = (
-            user.full_name
-            or user.username
-            or str(user.id)
-        )
-
-        is_correct = (
-            selected_index
-            == poll_row.correct_index
-        )
+        user_name = user.full_name or user.username or str(user.id)
 
         existing = session.scalar(
             select(PollAnswer)
-            .where(
-                PollAnswer.poll_id
-                == answer.poll_id,
-                PollAnswer.user_id
-                == user.id,
+            .where(PollAnswer.poll_id == answer.poll_id, PollAnswer.user_id == user.id)
+            .limit(1)
+        )
+        if existing:
+            # Safety fallback if Telegram still sends an update after a client-side
+            # retry. Keep first answer to preserve exam semantics.
+            return
+
+        session.add(
+            PollAnswer(
+                poll_id=answer.poll_id,
+                run_id=poll_row.run_id,
+                user_id=user.id,
+                user_name=user_name,
+                selected_index=selected_index,
+                is_correct=is_correct,
+                answered_at=now,
             )
         )
-
-        if existing:
-
-            existing.selected_index = selected_index
-            existing.user_name = user_name
-            existing.is_correct = is_correct
-            existing.answered_at = datetime.now(
-                timezone.utc
-            )
-
-        else:
-
-            session.add(
-                PollAnswer(
-                    poll_id=answer.poll_id,
-                    user_id=user.id,
-                    user_name=user_name,
-                    selected_index=selected_index,
-                    is_correct=is_correct,
-                    answered_at=datetime.now(
-                        timezone.utc
-                    ),
-                )
-            )
-
         session.commit()
 
 
-def is_poll_open(
-    session,
-    quiz_id: str,
-) -> bool:
-
-    quiz = session.get(
-        Quiz,
-        quiz_id,
-    )
-
-    if not quiz:
-        return False
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    return quiz.closes_at > now
-
-
-# ----------------------------
-# Leaderboard
-# ----------------------------
-
-def build_leaderboard(
-    quiz_id: str,
-) -> str:
-
+def build_leaderboard(run_id: str) -> str:
     with SessionLocal() as session:
-
-        polls = session.scalars(
-            select(QuizPoll)
-            .where(
-                QuizPoll.quiz_id == quiz_id
-            )
-        ).all()
-
-        quiz = session.get(
-            Quiz,
-            quiz_id,
-        )
-
+        run = session.get(QuizRun, run_id)
+        if not run:
+            return "Quiz run à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤"
+        quiz = session.get(Quiz, run.quiz_id)
         if not quiz:
-            return "Quiz not found."
-
-        poll_ids = [
-            poll.poll_id
-            for poll in polls
-        ]
-
-        if not poll_ids:
-            return (
-                "ðŸ† ECA LIVE QUIZ â€” TOP 50\n\n"
-                "à¤•à¥‹à¤ˆ participant result à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤"
-            )
+            return "Quiz à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤"
 
         answers = session.scalars(
-            select(PollAnswer)
-            .where(
-                PollAnswer.poll_id.in_(
-                    poll_ids
-                )
-            )
+            select(PollAnswer).where(PollAnswer.run_id == run_id)
         ).all()
 
     participant_map: dict[int, dict[str, Any]] = {}
-
-    for answer in answers:
-
-        p = participant_map.setdefault(
-            answer.user_id,
-            {
-                "name": answer.user_name,
-                "correct": 0,
-                "wrong": 0,
-            },
+    for ans in answers:
+        item = participant_map.setdefault(
+            ans.user_id,
+            {"name": ans.user_name, "correct": 0, "wrong": 0},
         )
-
-        p["name"] = answer.user_name
-
-        if answer.is_correct:
-            p["correct"] += 1
+        item["name"] = ans.user_name
+        if ans.is_correct:
+            item["correct"] += 1
         else:
-            p["wrong"] += 1
+            item["wrong"] += 1
 
-    rows = []
-
-    for user_id, data in participant_map.items():
-
-        correct = int(
-            data["correct"]
-        )
-
-        wrong = int(
-            data["wrong"]
-        )
-
-        raw_marks = (
-            correct
-            - (wrong / 3)
-        )
-
+    rows: list[dict[str, Any]] = []
+    for user_id, item in participant_map.items():
+        correct = int(item["correct"])
+        wrong = int(item["wrong"])
+        raw_marks = correct - (wrong / 3)
         rows.append(
             {
                 "user_id": user_id,
-                "name": data["name"],
+                "name": str(item["name"]),
                 "correct": correct,
                 "wrong": wrong,
                 "raw_marks": raw_marks,
             }
         )
 
-    rows.sort(
-        key=lambda x: x["raw_marks"],
-        reverse=True,
-    )
-
-    previous_marks = None
-    current_rank = 0
-
-    for index, row in enumerate(
-        rows,
-        start=1,
-    ):
-
+    rows.sort(key=lambda x: x["raw_marks"], reverse=True)
+    previous = None
+    rank = 0
+    for index, row in enumerate(rows, 1):
         marks = row["raw_marks"]
-
-        if (
-            previous_marks is None
-            or marks != previous_marks
-        ):
-            current_rank = index
-
-        row["rank"] = current_rank
-        previous_marks = marks
+        # Compare rounded marks to avoid binary floating point artifacts.
+        marks_key = round(marks, 8)
+        if previous is None or marks_key != previous:
+            rank = index
+        row["rank"] = rank
+        previous = marks_key
 
     lines = [
         "ðŸ† ECA LIVE QUIZ â€” TOP 50",
@@ -2539,159 +1894,121 @@ def build_leaderboard(
         f"Quiz: {quiz.title}",
         "",
     ]
-
     if not rows:
-        lines.append(
-            "à¤•à¥‹à¤ˆ participant result à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤"
-        )
+        lines.append("à¤•à¥‹à¤ˆ participant result à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
         return "\n".join(lines)
 
     for row in rows[:50]:
-
         lines.append(
-            f'{row["rank"]}. '
-            f'{row["name"][:45]} â€” '
-            f'âœ…{row["correct"]} '
-            f'âŒ{row["wrong"]} | '
-            f'RM {row["raw_marks"]:.2f}'
+            f"{row['rank']}. {row['name'][:45]} â€” "
+            f"âœ…{row['correct']} âŒ{row['wrong']} | RM {row['raw_marks']:.2f}"
         )
-
     return "\n".join(lines)
 
 
-async def send_leaderboard_job(
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-
-    job = context.job
-
-    if not job or not job.data:
-        return
-
-    quiz_id = job.data["quiz_id"]
-    chat_id = job.data["chat_id"]
-
-    with SessionLocal() as session:
-
-        quiz = session.get(
-            Quiz,
-            quiz_id,
-        )
-
-        if not quiz or quiz.leaderboard_sent:
-            return
-
-        quiz.leaderboard_sent = True
-        session.commit()
-
-    text = await asyncio.to_thread(
-        build_leaderboard,
-        quiz_id,
-    )
-
+async def safe_send_message(bot: Any, chat_id: int, text: str) -> None:
     try:
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text[:4096],
-        )
-
+        await bot.send_message(chat_id=chat_id, text=text[:4096])
     except Exception:
-        logger.exception(
-            "Could not send leaderboard."
+        logger.exception("Could not send message to chat=%s", chat_id)
+
+
+# ============================================================
+# Recovery after Render restart
+# ============================================================
+
+async def recover_active_runs(application: Application) -> None:
+    """Recover persisted active runs after a process restart.
+
+    We use the DB as the source of truth. If the last poll's scheduled job was
+    lost during restart, schedule the next poll from the stored closes_at.
+    """
+    with SessionLocal() as session:
+        active_runs = session.scalars(
+            select(QuizRun).where(QuizRun.active == True)  # noqa: E712
+        ).all()
+
+    now = datetime.now(timezone.utc)
+    recovered = 0
+    for run in active_runs:
+        with SessionLocal() as session:
+            last_poll = session.scalar(
+                select(QuizPoll)
+                .where(QuizPoll.run_id == run.id)
+                .order_by(QuizPoll.question_no.desc())
+                .limit(1)
+            )
+
+        if not last_poll:
+            delay = 0.5
+        else:
+            delay = max(0.5, (last_poll.closes_at - now).total_seconds())
+
+        application.job_queue.run_once(
+            send_next_question_job,
+            when=delay,
+            data={"run_id": run.id},
+            name=f"eca-recover-{run.id}",
         )
+        recovered += 1
+    logger.info("Recovered %s active quiz runs after startup.", recovered)
 
 
-# ----------------------------
-# Manual cancel
-# ----------------------------
+# ============================================================
+# Cancel/help/error/startup
+# ============================================================
 
-async def cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    cleanup_file(
-        context.user_data.get(
-            "source_file"
-        )
-    )
-
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    for path in list(context.user_data.get("source_files", [])):
+        cleanup_file(path)
+    # Backward-compatible cleanup if an old state left a single source_file.
+    cleanup_file(context.user_data.get("source_file"))
     context.user_data.clear()
-
     await update.effective_message.reply_text(
         "âŒ Operation cancelled.",
         reply_markup=ReplyKeyboardRemove(),
     )
-
     return ConversationHandler.END
 
 
-# ----------------------------
-# File cleanup
-# ----------------------------
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "ðŸ“š ECA QUIZ MAKER\n\n"
+        "/start â€” Quiz Maker\n"
+        "/cancel â€” Current operation cancel\n"
+        "/whoami â€” Telegram User ID\n\n"
+        "OWNER:\n"
+        "/addadmin â€” user message à¤ªà¤° reply à¤•à¤°à¤•à¥‡\n"
+        "/removeadmin â€” admin message à¤ªà¤° reply à¤•à¤°à¤•à¥‡\n"
+        "/admins â€” Admin list\n\n"
+        "Main Modes:\n"
+        "ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡\n"
+        "ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾"
+    )
 
-def cleanup_file(
-    path: Optional[str]
-) -> None:
 
-    if not path:
-        return
-
+async def post_init(application: Application) -> None:
     try:
-        Path(path).unlink(
-            missing_ok=True
-        )
+        await application.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
-        pass
-
-
-# ----------------------------
-# Error handler
-# ----------------------------
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-
-    logger.error(
-        "Unhandled error: %s",
-        context.error,
-        exc_info=context.error,
-    )
-
-
-# ----------------------------
-# Post-init
-# ----------------------------
-
-async def post_init(
-    application: Application,
-) -> None:
-
-    # Remove webhook so long polling can own getUpdates.
-    await application.bot.delete_webhook(
-        drop_pending_updates=True
-    )
-
+        logger.exception("delete_webhook failed.")
     me = await application.bot.get_me()
-
-    logger.info(
-        "Started as @%s",
-        me.username,
-    )
+    logger.info("Started as @%s", me.username)
+    await recover_active_runs(application)
 
 
-# ----------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+
+
+# ============================================================
 # Main
-# ----------------------------
+# ============================================================
+
 
 def main() -> None:
-
     init_db()
 
-    # Render health server
     threading.Thread(
         target=start_health_server,
         name="eca-health-server",
@@ -2705,320 +2022,39 @@ def main() -> None:
         .build()
     )
 
-    # Conversation:
-    # 0 = main mode
-    # 1 = source type
-    # 2 = topic
-    # 3 = source text/url
-    # 4 = source file/poll
-    # 5 = count
-    # 6 = language
-    # 7 = start location
-    # 8 = per-question time
-
     conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler(
-                "start",
-                start,
-            )
-        ],
-
+        entry_points=[CommandHandler("start", start)],
         states={
-
-            0: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    choose_mode,
-                )
+            STATE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_mode)],
+            STATE_SOURCE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_source_type)],
+            STATE_SOURCE_CONTENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_source_text),
+                MessageHandler(filters.PHOTO | filters.Document.ALL | filters.POLL, receive_source_file),
             ],
-
-            1: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    choose_source_type,
-                )
-            ],
-
-            2: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_topic,
-                )
-            ],
-
-            3: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_source_text,
-                )
-            ],
-
-            4: [
-                MessageHandler(
-                    filters.PHOTO,
-                    receive_source_file,
-                ),
-
-                MessageHandler(
-                    filters.Document.PDF,
-                    receive_source_file,
-                ),
-
-                MessageHandler(
-                    filters.POLL,
-                    receive_source_file,
-                ),
-            ],
-
-            5: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_count,
-                )
-            ],
-
-            6: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_language,
-                )
-            ],
-
-            7: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    choose_start_location,
-                )
-            ],
-
-            8: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    choose_question_time,
-                )
-            ],
+            STATE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_topic)],
+            STATE_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_count)],
+            STATE_LANGUAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_language)],
+            STATE_START_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_start_location)],
+            STATE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_question_time)],
+            STATE_GROUP_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_group_start_time)],
         },
-
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                cancel,
-            )
-        ],
-
+        fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
 
-    # Existing handlers
-    application.add_handler(
-        conversation
-    )
+    application.add_handler(conversation)
+    application.add_handler(CommandHandler("addadmin", add_admin))
+    application.add_handler(CommandHandler("removeadmin", remove_admin))
+    application.add_handler(CommandHandler("admins", list_admins))
+    application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(PollAnswerHandler(poll_answer_handler))
+    application.add_error_handler(error_handler)
 
-    # Admin management
-    application.add_handler(
-        CommandHandler(
-            "addadmin",
-            add_admin,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "removeadmin",
-            remove_admin,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "admins",
-            list_admins,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "whoami",
-            whoami,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    # Poll answers
-    application.add_handler(
-        PollAnswerHandler(
-            poll_answer_handler,
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "ECA Quiz Maker Bot is running..."
-    )
-
+    logger.info("ECA Quiz Maker Bot is running...")
     application.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-    )
-
-
-# ============================================================
-# Missing conversation functions are defined below to keep
-# the state machine readable.
-# ============================================================
-
-async def receive_topic(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    topic = update.effective_message.text.strip()
-
-    if len(topic) < 2:
-        await update.effective_message.reply_text(
-            "âŒ Valid Topic à¤­à¥‡à¤œà¤¿à¤à¥¤"
-        )
-        return 2
-
-    context.user_data[
-        "topic"
-    ] = topic
-
-    await update.effective_message.reply_text(
-        "à¤•à¤¿à¤¤à¤¨à¥‡ questions à¤šà¤¾à¤¹à¤¿à¤?\n\n"
-        "1 à¤¸à¥‡ 100 à¤•à¥‡ à¤¬à¥€à¤š à¤¸à¤‚à¤–à¥à¤¯à¤¾ à¤­à¥‡à¤œà¤¿à¤à¥¤"
-    )
-
-    return 5
-
-
-async def receive_count(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    try:
-        count = int(
-            update.effective_message.text.strip()
-        )
-    except ValueError:
-        await update.effective_message.reply_text(
-            "âŒ à¤•à¥‡à¤µà¤² à¤¸à¤‚à¤–à¥à¤¯à¤¾ à¤­à¥‡à¤œà¤¿à¤à¥¤"
-        )
-        return 5
-
-    if not 1 <= count <= MAX_QUESTIONS:
-        await update.effective_message.reply_text(
-            f"âŒ à¤¸à¤‚à¤–à¥à¤¯à¤¾ 1 à¤¸à¥‡ {MAX_QUESTIONS} à¤•à¥‡ à¤¬à¥€à¤š à¤¹à¥‹à¤¨à¥€ à¤šà¤¾à¤¹à¤¿à¤à¥¤"
-        )
-        return 5
-
-    context.user_data[
-        "question_count"
-    ] = count
-
-    keyboard = [
-        ["à¤¹à¤¿à¤‚à¤¦à¥€", "English"],
-        ["Bilingual"],
-    ]
-
-    await update.effective_message.reply_text(
-        "Language à¤šà¥à¤¨à¥‡à¤‚:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
-
-    return 6
-
-
-async def receive_language(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return ConversationHandler.END
-
-    mapping = {
-        "à¤¹à¤¿à¤‚à¤¦à¥€": "Hindi",
-        "English": "English",
-        "Bilingual": "Bilingual",
-    }
-
-    language = mapping.get(
-        update.effective_message.text.strip()
-    )
-
-    if not language:
-        await update.effective_message.reply_text(
-            "à¤¹à¤¿à¤‚à¤¦à¥€, English à¤¯à¤¾ Bilingual à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤"
-        )
-        return 6
-
-    context.user_data[
-        "language"
-    ] = language
-
-    await publish_quiz(
-        update,
-        context,
-    )
-
-    context.user_data.clear()
-
-    return ConversationHandler.END
-
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-
-    await update.effective_message.reply_text(
-        "ðŸ“š ECA QUIZ MAKER\n\n"
-        "/start â€” Quiz Maker\n"
-        "/cancel â€” Current operation cancel\n"
-        "/whoami â€” Telegram User ID\n\n"
-        "OWNER:\n"
-        "/addadmin â€” target message à¤ªà¤° reply à¤•à¤°à¤•à¥‡\n"
-        "/removeadmin â€” admin message à¤ªà¤° reply à¤•à¤°à¤•à¥‡\n"
-        "/admins â€” Admin list\n\n"
-        "Main Modes:\n"
-        "ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡\n"
-        "ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾"
     )
 
 
