@@ -1,38 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-ECA QUIZ MAKER - Production Telegram Quiz Bot
-
-Designed for Render + Telegram + Google Gemini.
-
-Core flow
----------
-1) AI Generate Questions
-2) I Will Provide Source
-
-AI mode: Topic -> Count -> Language -> Gemini searches/grounds sources ->
-original MCQs -> strict validation -> prepared quiz.
-
-Source mode: PDF / Photo / Text / Telegram Poll / URL -> Topic -> Count ->
-Language -> original MCQs based on supplied material.
-
-Prepared quiz is NEVER dumped as a batch of Telegram polls.
-Admin chooses Personal or Group, then chooses per-question time:
-15 sec / 25 sec / 30 sec / 1 min.
-Exactly one native Telegram quiz poll is published at a time.
-
-Important quota behavior
-------------------------
-A 429 RESOURCE_EXHAUSTED error is a provider quota problem. Changing models
-inside the same Google project does NOT magically create quota. This bot:
-- avoids repeated hammering of the same key/model;
-- supports multiple GEMINI_API_KEYS (comma-separated);
-- uses a single bounded retry for transient failures;
-- records/returns partial valid output rather than fabricating questions;
-- never bypasses validation just to reach the requested count.
-
-For actual multi-key quota failover, keys should belong to separately usable
-projects/quotas. Never paste keys into Telegram/GitHub.
-"""
+""" ECA QUIZ MAKER - Production Telegram Quiz Bot Designed for Render + Telegram + Google Gemini. Core flow --------- 1) AI Generate Questions 2) I Will Provide Source AI mode: Topic -> Count -> Language -> Gemini searches/grounds sources -> original MCQs -> strict validation -> prepared quiz. Source mode: PDF / Photo / Text / Telegram Poll / URL -> Topic -> Count -> Language -> original MCQs based on supplied material. Prepared quiz is NEVER dumped as a batch of Telegram polls. Admin chooses Personal or Group, then chooses per-question time: 15 sec / 25 sec / 30 sec / 1 min. Exactly one native Telegram quiz poll is published at a time. Important quota behavior ------------------------ A 429 RESOURCE_EXHAUSTED error is a provider quota problem. Changing models inside the same Google project does NOT magically create quota. This bot: - avoids repeated hammering of the same key/model; - supports multiple GEMINI_API_KEYS (comma-separated); - uses a single bounded retry for transient failures; - records/returns partial valid output rather than fabricating questions; - never bypasses validation just to reach the requested count. For actual multi-key quota failover, keys should belong to separately usable projects/quotas. Never paste keys into Telegram/GitHub. """
 
 from __future__ import annotations
 
@@ -519,7 +486,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     username = f"@{user.username}" if user and user.username else "-"
     await update.effective_message.reply_text(
-        f" Telegram User ID\n{user.id}\n\nUsername: {username}"
+        f"Telegram User ID\n{user.id}\n\nUsername: {username}"
     )
 
 
@@ -684,12 +651,7 @@ TELEGRAM_URL = "https://t.me/EternalCivilAcademy"
 
 
 def find_unicode_pdf_font() -> tuple[str, Optional[str]]:
-    """Find a Unicode TTF available in the hosting environment.
-
-    DejaVu Sans is commonly present on Debian/Ubuntu-based Render images and
-    covers the Latin + Devanagari text needed by the ECA booklet. We also check
-    a few other common system locations before falling back to Helvetica.
-    """
+    """Find a Unicode TTF available in the hosting environment. DejaVu Sans is commonly present on Debian/Ubuntu-based Render images and covers the Latin + Devanagari text needed by the ECA booklet. We also check a few other common system locations before falling back to Helvetica. """
     candidates = [
         (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -801,22 +763,7 @@ def _pdf_header_footer(canvas, doc) -> None:
 
 
 def build_answer_explanation_pdf(run_id: str, output_path: str) -> str:
-    """Create the requested ECA answer + explanation booklet.
-
-    The PDF contains:
-      - Test number
-      - Quiz title/topic
-      - Total questions
-      - Actual quiz start date/time
-      - Time per question
-      - Quiz language
-      - ECA branding + Telegram link
-      - Every question
-      - Correct answer
-      - Explanation
-
-    It intentionally does NOT contain student-wise marks, rank, or attempts.
-    """
+    """Create the requested ECA answer + explanation booklet. The PDF contains: - Test number - Quiz title/topic - Total questions - Actual quiz start date/time - Time per question - Quiz language - ECA branding + Telegram link - Every question - Correct answer - Explanation It intentionally does NOT contain student-wise marks, rank, or attempts. """
     with SessionLocal() as session:
         run = session.get(QuizRun, run_id)
         if not run:
@@ -1008,11 +955,7 @@ def build_answer_explanation_pdf(run_id: str, output_path: str) -> str:
     return str(output)
 
 
-async def send_answer_explanation_pdf(
-    context: ContextTypes.DEFAULT_TYPE,
-    run_id: str,
-    chat_id: int,
-) -> None:
+async def send_answer_explanation_pdf( context: ContextTypes.DEFAULT_TYPE, run_id: str, chat_id: int, ) -> None:
     """Build and send the completed quiz answer/explanation PDF."""
     pdf_path = Path(tempfile.gettempdir()) / f"eca_test_{run_id.replace('/', '_')}.pdf"
     try:
@@ -1076,44 +1019,10 @@ QUESTION_SCHEMA = {
 }
 
 
-SYSTEM_INSTRUCTION = """
-You are the senior competitive-exam question setter for Eternal Civil Academy (ECA).
-Target: UPSC, UPPSC/PCS, BPSC, MPPSC, State PCS and similarly serious exams.
-
-NON-NEGOTIABLE:
-- Create ORIGINAL MCQs. Never copy or closely paraphrase a source question.
-- Never repeat previous ECA questions or obvious near-duplicates.
-- Exactly 4 options and exactly 1 correct option.
-- Questions must be objective, unambiguous, exam-standard and factually supportable.
-- Never invent an Article, Act, rule, committee, judgment, report, scheme, statistic, date or institutional fact.
-- Prefer primary/authoritative sources for AI-search mode: government, Parliament, ministries, constitutional/legal texts, RBI, SEBI, UPSC, NCERT, ECI, official reports, UN/World Bank etc. as appropriate.
-- Spread questions across meaningful subtopics, chronology, concepts, provisions, cause-effect, comparison, application and analytical angles.
-- Avoid repeating one narrow factual template. At most 1-2 questions from one narrow subtopic in a batch.
-- Keep each question <=300 characters.
-- Keep each option <=100 characters.
-- Keep each explanation <=200 characters.
-- Explanation must state why the correct option is correct and briefly distinguish the other three options.
-- Quality is more important than count. Return fewer valid questions rather than weak/fabricated ones.
-- Preserve the requested language exactly.
-- Source field must identify the factual basis actually used. Never fabricate a URL.
-- Return only the requested JSON structure.
-
-LANGUAGE:
-Hindi = standard exam Hindi; English technical terms may be placed in brackets.
-English = clear exam-standard English.
-Bilingual = concise Hindi + English without sacrificing factual quality.
-"""
+SYSTEM_INSTRUCTION = """ You are the senior competitive-exam question setter for Eternal Civil Academy (ECA). Target: UPSC, UPPSC/PCS, BPSC, MPPSC, State PCS and similarly serious exams. NON-NEGOTIABLE: - Create ORIGINAL MCQs. Never copy or closely paraphrase a source question. - Never repeat previous ECA questions or obvious near-duplicates. - Exactly 4 options and exactly 1 correct option. - Questions must be objective, unambiguous, exam-standard and factually supportable. - Never invent an Article, Act, rule, committee, judgment, report, scheme, statistic, date or institutional fact. - Prefer primary/authoritative sources for AI-search mode: government, Parliament, ministries, constitutional/legal texts, RBI, SEBI, UPSC, NCERT, ECI, official reports, UN/World Bank etc. as appropriate. - Spread questions across meaningful subtopics, chronology, concepts, provisions, cause-effect, comparison, application and analytical angles. - Avoid repeating one narrow factual template. At most 1-2 questions from one narrow subtopic in a batch. - Keep each question <=300 characters. - Keep each option <=100 characters. - Keep each explanation <=200 characters. - Explanation must state why the correct option is correct and briefly distinguish the other three options. - Quality is more important than count. Return fewer valid questions rather than weak/fabricated ones. - Preserve the requested language exactly. - Source field must identify the factual basis actually used. Never fabricate a URL. - Return only the requested JSON structure. LANGUAGE: Hindi = standard exam Hindi; English technical terms may be placed in brackets. English = clear exam-standard English. Bilingual = concise Hindi + English without sacrificing factual quality. """
 
 
-def build_prompt(
-    topic: str,
-    count: int,
-    language: str,
-    mode: str,
-    source_text: str = "",
-    history: Optional[list[str]] = None,
-    already_generated: Optional[list[str]] = None,
-) -> str:
+def build_prompt( topic: str, count: int, language: str, mode: str, source_text: str = "", history: Optional[list[str]] = None, already_generated: Optional[list[str]] = None, ) -> str:
     history = history or []
     already_generated = already_generated or []
 
@@ -1121,17 +1030,9 @@ def build_prompt(
     current_block = "\n".join(f"- {q[:450]}" for q in already_generated[-50:]) or "(No questions in this request yet.)"
 
     if mode == "ai":
-        research_block = """
-You MUST use Google Search grounding before finalizing factual claims.
-Prefer official/primary sources. Cross-check important facts when appropriate.
-Do not rely on unsupported memory for current or legal/official facts.
-"""
+        research_block = """ You MUST use Google Search grounding before finalizing factual claims. Prefer official/primary sources. Cross-check important facts when appropriate. Do not rely on unsupported memory for current or legal/official facts. """
     else:
-        research_block = """
-The supplied source is the PRIMARY basis. Use only the supplied material for
-facts unless an additional verification is genuinely necessary. Do not replace
-it with unrelated information. Do not copy any source MCQ.
-"""
+        research_block = """ The supplied source is the PRIMARY basis. Use only the supplied material for facts unless an additional verification is genuinely necessary. Do not replace it with unrelated information. Do not copy any source MCQ. """
 
     source_block = ""
     if source_text:
@@ -1142,34 +1043,7 @@ it with unrelated information. Do not copy any source MCQ.
             "---------------- END ----------------\n"
         )
 
-    return f"""
-Create up to {count} ORIGINAL MCQs.
-
-TOPIC:
-{topic}
-
-REQUESTED LANGUAGE:
-{language}
-
-{research_block}
-
-PREVIOUS ECA QUESTIONS - DO NOT REPEAT OR CLOSELY PARAPHRASE:
-{history_block}
-
-QUESTIONS ALREADY CREATED IN THIS REQUEST - DO NOT REPEAT:
-{current_block}
-
-DIVERSITY:
-Use different meaningful subtopics/angles. Do not make a list of the same
-factual pattern. If the topic is narrow, return fewer questions.
-
-STRICT OUTPUT:
-Exactly four options. Exactly one correct index (0-3). No ambiguity.
-Every source field must describe the real factual basis.
-{source_block}
-
-Return only valid JSON matching the supplied schema.
-"""
+    return f""" Create up to {count} ORIGINAL MCQs. TOPIC: {topic} REQUESTED LANGUAGE: {language} {research_block} PREVIOUS ECA QUESTIONS - DO NOT REPEAT OR CLOSELY PARAPHRASE: {history_block} QUESTIONS ALREADY CREATED IN THIS REQUEST - DO NOT REPEAT: {current_block} DIVERSITY: Use different meaningful subtopics/angles. Do not make a list of the same factual pattern. If the topic is narrow, return fewer questions. STRICT OUTPUT: Exactly four options. Exactly one correct index (0-3). No ambiguity. Every source field must describe the real factual basis. {source_block} Return only a single valid JSON object matching the supplied schema. Do not use Markdown code fences or add commentary before or after the JSON. """
 
 
 # ============================================================
@@ -1177,25 +1051,26 @@ Return only valid JSON matching the supplied schema.
 # ============================================================
 
 
-def _generate_with_client(
-    client: genai.Client,
-    model_name: str,
-    prompt: str,
-    use_search: bool,
-    source_files: Optional[list[str]] = None,
-) -> dict[str, Any]:
+def _generate_with_client( client: genai.Client, model_name: str, prompt: str, use_search: bool, source_files: Optional[list[str]] = None, ) -> dict[str, Any]:
     tools: list[Any] = []
     if use_search:
         tools.append(types.Tool(google_search=types.GoogleSearch()))
 
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
-        temperature=0.25,
-        max_output_tokens=12000,
-        response_mime_type="application/json",
-        response_schema=QUESTION_SCHEMA,
-        tools=tools or None,
-    )
+    config_kwargs: dict[str, Any] = {
+        "system_instruction": SYSTEM_INSTRUCTION,
+        "temperature": 0.25,
+        "max_output_tokens": 12000,
+        "tools": tools or None,
+    }
+
+    # Gemini 2.5 can use Google Search grounding, but structured-output
+    # schema enforcement cannot be combined with built-in tools. Keep the
+    # schema for source mode and use JSON MIME output for AI/search mode.
+    config_kwargs["response_mime_type"] = "application/json"
+    if not use_search:
+        config_kwargs["response_schema"] = QUESTION_SCHEMA
+
+    config = types.GenerateContentConfig(**config_kwargs)
 
     contents: list[Any] = [prompt]
     for path in source_files or []:
@@ -1210,20 +1085,41 @@ def _generate_with_client(
     text = getattr(response, "text", None)
     if not text:
         raise RuntimeError("Gemini returned an empty response.")
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Gemini returned invalid JSON despite structured output.") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError("Gemini response was not a JSON object.")
-    return data
+    def parse_json_response(raw: str) -> dict[str, Any]:
+        raw = raw.strip()
+        candidates = [raw]
+
+        fenced = re.search(
+            r"```(?:json)?\s*(.*?)\s*```",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fenced:
+            candidates.insert(0, fenced.group(1).strip())
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(raw[start:end + 1])
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+        raise RuntimeError("Gemini returned a response that could not be parsed as JSON.")
+
+    return parse_json_response(text)
 
 
-async def call_ai(
-    prompt: str,
-    use_search: bool,
-    source_files: Optional[list[str]] = None,
-) -> dict[str, Any]:
+async def call_ai( prompt: str, use_search: bool, source_files: Optional[list[str]] = None, ) -> dict[str, Any]:
     remaining = cooldown_seconds_remaining()
     if remaining > 0:
         raise AIQuotaError(f"AI is temporarily cooling down after a quota failure. Retry in about {remaining}s.")
@@ -1337,10 +1233,7 @@ def valid_question(item: dict[str, Any]) -> bool:
         return False
 
 
-def post_validate(
-    candidates: list[dict[str, Any]],
-    accepted: Optional[list[dict[str, Any]]] = None,
-) -> list[dict[str, Any]]:
+def post_validate( candidates: list[dict[str, Any]], accepted: Optional[list[dict[str, Any]]] = None, ) -> list[dict[str, Any]]:
     accepted = list(accepted or [])
     subtopic_counts: dict[str, int] = {}
 
@@ -1368,16 +1261,7 @@ def post_validate(
     return valid
 
 
-async def make_ai_contents(
-    topic: str,
-    count: int,
-    language: str,
-    mode: str,
-    source_text: str,
-    source_files: Optional[list[str]],
-    history: list[str],
-    already_generated: list[str],
-) -> tuple[str, bool, list[str]]:
+async def make_ai_contents( topic: str, count: int, language: str, mode: str, source_text: str, source_files: Optional[list[str]], history: list[str], already_generated: list[str], ) -> tuple[str, bool, list[str]]:
     prompt = build_prompt(
         topic=topic,
         count=count,
@@ -1390,20 +1274,8 @@ async def make_ai_contents(
     return prompt, mode == "ai", list(source_files or [])
 
 
-async def generate_questions(
-    topic: str,
-    count: int,
-    language: str,
-    mode: str,
-    source_text: str = "",
-    source_files: Optional[list[str]] = None,
-    progress_callback: Optional[Any] = None,
-) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Return (questions, terminal_error_message).
-
-    We deliberately return valid partial output when the provider quota is hit,
-    rather than fabricating or forcing invalid questions.
-    """
+async def generate_questions( topic: str, count: int, language: str, mode: str, source_text: str = "", source_files: Optional[list[str]] = None, progress_callback: Optional[Any] = None, ) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Return (questions, terminal_error_message). We deliberately return valid partial output when the provider quota is hit, rather than fabricating or forcing invalid questions. """
     generated: list[dict[str, Any]] = []
     source_files = list(source_files or [])
 
@@ -1535,7 +1407,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             context.user_data["run_mode"] = "group"
             context.user_data["target_chat_id"] = message.chat.id
             await message.reply_text(
-                " QUIZ READY\n\n"
+                "QUIZ READY\n\n"
                 f" Topic: {quiz.title}\n"
                 f" Questions: {quiz.question_count}\n"
                 f" Language: {quiz.language}\n\n"
@@ -1545,7 +1417,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return STATE_GROUP_START_TIME
 
         await message.reply_text(
-            " QUIZ READY\n\n"
+            "QUIZ READY\n\n"
             f" Topic: {quiz.title}\n"
             f" Questions: {quiz.question_count}\n"
             f" Language: {quiz.language}\n\n"
@@ -1707,7 +1579,7 @@ async def receive_source_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["source_text"] = joined[:MAX_SOURCE_TEXT]
         context.user_data["source_summary"] = "One or more Telegram Poll sources"
         await update.effective_message.reply_text(
-            " Poll source received.\n\nYou can send more Polls. Press Source Ready when finished.",
+            "Poll source received.\n\nYou can send more Polls. Press Source Ready when finished.",
             reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
         return STATE_SOURCE_CONTENT
@@ -1735,7 +1607,7 @@ async def receive_source_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     paths.append(path)
     context.user_data["source_summary"] = f"{len(paths)} {source_type} source file(s)"
     await update.effective_message.reply_text(
-        f" Received {len(paths)} source file(s).\n\nYou can send more pages/files. Press Source Ready when finished.",
+        f"Received {len(paths)} source file(s).\n\nYou can send more pages/files. Press Source Ready when finished.",
         reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
     )
     return STATE_SOURCE_CONTENT
@@ -1798,7 +1670,7 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     source_files = list(context.user_data.get("source_files", []))
 
     status = await message.reply_text(
-        " Preparing the quiz...\n"
+        "Preparing the quiz...\n"
         "Questions will not be published yet.\n\n"
         "Running source verification, originality, and duplicate checks..."
     )
@@ -1885,7 +1757,7 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 partial += "\n\nGemini quota stopped further generation."
 
         await status.edit_text(
-            " QUIZ READY\n\n"
+            "QUIZ READY\n\n"
             f" Topic: {topic}\n"
             f" Questions: {len(questions)}\n"
             f" Language: {language}"
@@ -2024,7 +1896,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         session.commit()
 
     await update.effective_message.reply_text(
-        " QUIZ STARTING\n\n"
+        "QUIZ STARTING\n\n"
         f"Time: Time per question: {seconds} seconds\n"
         "Info: The next question starts automatically when time expires.\n"
         "Error: Questions will not be sent all at once.",
@@ -2176,29 +2048,20 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
         run.current_question = next_no
         session.commit()
 
-    if context.job_queue is None:
-        logger.error(
-            "JobQueue is unavailable. Install python-telegram-bot[job-queue] "
-            "so the next question can be scheduled."
+    if context.job_queue is not None:
+        context.job_queue.run_once(
+            send_next_question_job,
+            when=interval + 0.5,
+            data={"run_id": run_id},
+            name=f"eca-next-{run_id}-{next_no}",
         )
-        with SessionLocal() as session:
-            run = session.get(QuizRun, run_id)
-            if run:
-                run.active = False
-                session.commit()
-        await safe_send_message(
-            context.bot,
-            target,
-            "The quiz scheduler is unavailable. Please redeploy with the required JobQueue package.",
-        )
-        return
+    else:
+        # Fallback so the quiz still advances if JobQueue is not installed.
+        async def advance_after_delay() -> None:
+            await asyncio.sleep(interval + 0.5)
+            await send_next_question(context, run_id)
 
-    context.job_queue.run_once(
-        send_next_question_job,
-        when=interval + 0.5,
-        data={"run_id": run_id},
-        name=f"eca-next-{run_id}-{next_no}",
-    )
+        asyncio.create_task(advance_after_delay())
 
 
 async def send_next_question_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2259,18 +2122,7 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def build_leaderboard(run_id: str) -> str:
-    """Build the final leaderboard for a completed quiz run.
-
-    Participant rule:
-      - Only students who attempted at least one question are listed.
-      - If more than 50 students attempted, only the first 50 sorted by correct
-        answers are shown.
-
-    Ranking rule requested by ECA:
-      - Rank is based on number of correct answers.
-      - Students with the same number of correct answers receive the same rank.
-      - Raw marks are displayed separately as Correct - Wrong/3.
-    """
+    """Build the final leaderboard for a completed quiz run. Participant rule: - Only students who attempted at least one question are listed. - If more than 50 students attempted, only the first 50 sorted by correct answers are shown. Ranking rule requested by ECA: - Rank is based on number of correct answers. - Students with the same number of correct answers receive the same rank. - Raw marks are displayed separately as Correct - Wrong/3. """
     with SessionLocal() as session:
         run = session.get(QuizRun, run_id)
         if not run:
@@ -2330,7 +2182,7 @@ def build_leaderboard(run_id: str) -> str:
         previous_correct = correct_key
 
     lines = [
-        " ECA LIVE QUIZ - LEADERBOARD",
+        "ECA LIVE QUIZ - LEADERBOARD",
         "",
         f"Quiz: {repair_mojibake(quiz.title)}",
         "",
@@ -2346,7 +2198,7 @@ def build_leaderboard(run_id: str) -> str:
         raw_text = f"{raw:.2f}".rstrip("0").rstrip(".")
         lines.append(
             f"{row['name'][:45]} ({row['user_id']}) - "
-            f"{row['correct']} Error:{row['wrong']} â­•{row['unattempted']} "
+            f"Correct:{row['correct']} Wrong:{row['wrong']} Unattempted:{row['unattempted']} "
             f"[Raw marks-{raw_text}] {row['rank']}"
         )
 
@@ -2366,11 +2218,7 @@ async def safe_send_message(bot: Any, chat_id: int, text: str) -> None:
 # ============================================================
 
 async def recover_active_runs(application: Application) -> None:
-    """Recover persisted active runs after a process restart.
-
-    We use the DB as the source of truth. If the last poll's scheduled job was
-    lost during restart, schedule the next poll from the stored closes_at.
-    """
+    """Recover persisted active runs after a process restart. We use the DB as the source of truth. If the last poll's scheduled job was lost during restart, schedule the next poll from the stored closes_at. """
     with SessionLocal() as session:
         active_runs = session.scalars(
             select(QuizRun).where(QuizRun.active == True)  # noqa: E712
