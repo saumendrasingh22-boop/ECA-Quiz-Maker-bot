@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ECA QUIZ MAKER Ã¢â‚¬â€ Production Telegram Quiz Bot
+ECA QUIZ MAKER - Production Telegram Quiz Bot
 
 Designed for Render + Telegram + Google Gemini.
 
 Core flow
 ---------
-1) Ã°Å¸Â¤â€“ AI Ã Â¤â€“Ã Â¥ÂÃ Â¤Â¦ Questions Generate Ã Â¤â€¢Ã Â¤Â°Ã Â¥â€¡
-2) Ã°Å¸â€œÅ¡ Ã Â¤Â®Ã Â¥Ë†Ã Â¤â€š Ã Â¤â€“Ã Â¥ÂÃ Â¤Â¦ Source Ã Â¤Â¦Ã Â¥â€šÃ Â¤ÂÃ Â¤â€”Ã Â¤Â¾
+1) AI Generate Questions
+2) I Will Provide Source
 
 AI mode: Topic -> Count -> Language -> Gemini searches/grounds sources ->
 original MCQs -> strict validation -> prepared quiz.
@@ -99,12 +99,12 @@ if os.getenv("GEMINI_API_KEY", "").strip():
 # Remove duplicates while preserving order.
 GEMINI_API_KEYS = list(dict.fromkeys(GEMINI_API_KEYS))
 
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 FALLBACK_MODELS = [
     x.strip()
     for x in os.getenv(
         "GEMINI_FALLBACK_MODELS",
-        "gemini-3.1-flash-lite,gemini-3.5-flash",
+        "gemini-2.5-flash-lite",
     ).split(",")
     if x.strip()
 ]
@@ -137,14 +137,14 @@ TIME_OPTIONS = {
 TIME_BUTTONS = [["15 seconds", "25 seconds"], ["30 seconds", "1 minute"]]
 
 MAIN_BUTTONS = [
-    ["Ã°Å¸Â¤â€“ AI Generate Questions"],
-    ["Ã°Å¸â€œÅ¡ I Will Provide Source"],
+    ["AI Generate Questions"],
+    ["I Will Provide Source"],
 ]
 
 SOURCE_TYPE_BUTTONS = [
-    ["Ã°Å¸â€œâ€ž PDF", "Ã°Å¸â€“Â¼ Photo"],
-    ["Ã°Å¸â€œÂ Text", "Ã°Å¸â€œÅ  Telegram Poll"],
-    ["Ã°Å¸â€â€” URL"],
+    ["PDF", "Photo"],
+    ["Text", "Telegram Poll"],
+    ["URL"],
 ]
 
 
@@ -380,24 +380,29 @@ def set_ai_cooldown(seconds: int = 45) -> None:
 # Text helpers / duplicate detection
 # ============================================================
 
-MOJIBAKE_MARKERS = ("ÃƒÂ Ã‚Â¤", "ÃƒÂ Ã‚Â¥", "ÃƒÂ°Ã…Â¸", "ÃƒÂ¢", "ÃƒÆ’", "Ãƒâ€š")
+MOJIBAKE_MARKERS = ("Ãƒ", "Ã‚", "Ã°", "Ã¢", "Ã Â¤", "ï¿½")
 
 def repair_mojibake(value: Any) -> str:
-    """Repair common UTF-8-as-Latin-1 mojibake without touching valid Hindi/English.
-
-    This is a defensive guard for copied/stored text. Normal Unicode text is returned unchanged.
-    """
+    """Repair common UTF-8 mojibake defensively without altering normal Unicode text."""
     text = str(value or "")
-    if not any(marker in text for marker in MOJIBAKE_MARKERS):
-        return text
-    for encoding in ("latin1", "cp1252"):
-        try:
-            candidate = text.encode(encoding).decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            continue
-        if candidate and not any(marker in candidate for marker in MOJIBAKE_MARKERS):
-            return candidate
-    return text
+    best = text
+
+    def bad_score(s: str) -> int:
+        return sum(s.count(marker) for marker in ("Ãƒ", "Ã‚", "Ã°", "Ã¢", "Ã Â¤", "ï¿½"))
+
+    for _ in range(3):
+        candidates = [best]
+        for encoding in ("cp1252", "latin1"):
+            try:
+                candidates.append(best.encode(encoding).decode("utf-8"))
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+        candidate = min(candidates, key=bad_score)
+        if bad_score(candidate) >= bad_score(best):
+            break
+        best = candidate
+
+    return best
 
 
 PUNCT_RE = re.compile(r"[^\w\s\u0900-\u097F]", flags=re.UNICODE)
@@ -512,15 +517,15 @@ def is_admin(user_id: int) -> bool:
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "Ã¢â‚¬â€"
+    username = f"@{user.username}" if user and user.username else "-"
     await update.effective_message.reply_text(
-        f"Ã°Å¸â€ â€ Telegram User ID\n{user.id}\n\nUsername: {username}"
+        f" Telegram User ID\n{user.id}\n\nUsername: {username}"
     )
 
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Only the Owner can add admins.")
+        await update.effective_message.reply_text("Only the Owner can add admins.")
         return
 
     target_id: Optional[int] = None
@@ -538,30 +543,30 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not target_id:
         await update.effective_message.reply_text(
-            "Ã Â¤â€¢Ã Â¤Â¿Ã Â¤Â¸Ã Â¥â‚¬ user Ã Â¤â€¢Ã Â¥â€¡ message Ã Â¤ÂªÃ Â¤Â° reply Ã Â¤â€¢Ã Â¤Â°Ã Â¤â€¢Ã Â¥â€¡ /addadmin Ã Â¤Â­Ã Â¥â€¡Ã Â¤Å“Ã Â¥â€¡Ã Â¤â€šÃ Â¥Â¤\n\n"
-            "Ã Â¤Â¯Ã Â¤Â¾ /addadmin USER_ID"
+            "Reply to the user message and send /addadmin.\n\n"
+            "Or use /addadmin USER_ID"
         )
         return
 
     if target_id == OWNER_USER_ID:
-        await update.effective_message.reply_text("Ã¢â€žÂ¹Ã¯Â¸Â This user is already the Owner.")
+        await update.effective_message.reply_text("This user is already the Owner.")
         return
 
     with SessionLocal() as session:
         if session.get(Admin, target_id):
-            await update.effective_message.reply_text(f"Ã¢â€žÂ¹Ã¯Â¸Â This user is already an Admin.\nID: {target_id}")
+            await update.effective_message.reply_text(f"This user is already an Admin.\nID: {target_id}")
             return
         session.add(Admin(user_id=target_id, added_by=OWNER_USER_ID))
         session.commit()
 
     await update.effective_message.reply_text(
-        f"Ã¢Å“â€¦ Admin authorized\n\nName: {target_name}\nUser ID: {target_id}"
+        f"Admin authorized\n\nName: {target_name}\nUser ID: {target_id}"
     )
 
 
 async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Only the Owner can remove admins.")
+        await update.effective_message.reply_text("Only the Owner can remove admins.")
         return
 
     target_id: Optional[int] = None
@@ -578,29 +583,29 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("Reply to the admin message with /removeadmin.")
         return
     if target_id == OWNER_USER_ID:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ The Owner cannot be removed.")
+        await update.effective_message.reply_text("The Owner cannot be removed.")
         return
 
     with SessionLocal() as session:
         admin = session.get(Admin, target_id)
         if not admin:
-            await update.effective_message.reply_text("Ã¢â€žÂ¹Ã¯Â¸Â This user is not an Admin.")
+            await update.effective_message.reply_text("This user is not an Admin.")
             return
         session.delete(admin)
         session.commit()
 
-    await update.effective_message.reply_text(f"Ã¢Å“â€¦ Admin access removed\nUser ID: {target_id}")
+    await update.effective_message.reply_text(f"Admin access removed\nUser ID: {target_id}")
 
 
 async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Only the Owner can view the admin list.")
+        await update.effective_message.reply_text("Only the Owner can view the admin list.")
         return
 
     with SessionLocal() as session:
         rows = session.scalars(select(Admin).order_by(Admin.added_at)).all()
 
-    lines = ["Ã°Å¸â€˜â€˜ ECA QUIZ MAKER ADMINS", "", f"Owner: {OWNER_USER_ID}", "", "Authorized Admins:"]
+    lines = ["ECA QUIZ MAKER ADMINS", "", f"Owner: {OWNER_USER_ID}", "", "Authorized Admins:"]
     if not rows:
         lines.append("No additional Admins.")
     else:
@@ -776,10 +781,15 @@ def _pdf_header_footer(canvas, doc) -> None:
         "Eternal Civil Academy"
     )
     canvas.setFont(PDF_FONT_NAME, 7.5)
-    canvas.drawCentredString(
-        width / 2,
-        9 * mm,
-        f"Telegram: {TELEGRAM_URL}"
+    link_text = "Telegram: @EternalCivilAcademy"
+    x = width / 2
+    y = 9 * mm
+    text_width = pdfmetrics.stringWidth(link_text, PDF_FONT_NAME, 7.5)
+    canvas.drawString(x - text_width / 2, y, link_text)
+    canvas.linkURL(
+        TELEGRAM_URL,
+        (x - text_width / 2, y - 1.5 * mm, x + text_width / 2, y + 3.0 * mm),
+        relative=0,
     )
     canvas.setFont(PDF_FONT_NAME, 7)
     canvas.drawRightString(
@@ -944,7 +954,7 @@ def build_answer_explanation_pdf(run_id: str, output_path: str) -> str:
             meta,
         ),
         Paragraph(
-            f"<b>TELEGRAM:</b> {escape_pdf_text(TELEGRAM_URL)}",
+            f"<b>TELEGRAM:</b> <link href=\"{TELEGRAM_URL}\">{escape_pdf_text(TELEGRAM_URL)}</link>",
             meta,
         ),
         Spacer(1, 4 * mm),
@@ -1016,7 +1026,7 @@ async def send_answer_explanation_pdf(
                 chat_id=chat_id,
                 document=fh,
                 filename=pdf_path.name,
-                caption="Eternal Civil Academy â€” Answer & Explanation Booklet",
+                caption="Eternal Civil Academy - Answer & Explanation Booklet",
             )
     except Exception:
         logger.exception("Could not generate/send answer explanation PDF for run=%s", run_id)
@@ -1143,10 +1153,10 @@ REQUESTED LANGUAGE:
 
 {research_block}
 
-PREVIOUS ECA QUESTIONS Ã¢â‚¬â€ DO NOT REPEAT OR CLOSELY PARAPHRASE:
+PREVIOUS ECA QUESTIONS - DO NOT REPEAT OR CLOSELY PARAPHRASE:
 {history_block}
 
-QUESTIONS ALREADY CREATED IN THIS REQUEST Ã¢â‚¬â€ DO NOT REPEAT:
+QUESTIONS ALREADY CREATED IN THIS REQUEST - DO NOT REPEAT:
 {current_block}
 
 DIVERSITY:
@@ -1407,7 +1417,7 @@ async def generate_questions(
             calls += 1
 
             if progress_callback:
-                await progress_callback(f"Ã¢ÂÂ³ AI question batch {calls} Ã Â¤Â¤Ã Â¥Ë†Ã Â¤Â¯Ã Â¤Â¾Ã Â¤Â° Ã Â¤â€¢Ã Â¤Â° Ã Â¤Â°Ã Â¤Â¹Ã Â¤Â¾ Ã Â¤Â¹Ã Â¥Ë†Ã¢â‚¬Â¦ ({len(generated)}/{count})")
+                await progress_callback(f"{len(generated)}/{count} valid questions are ready...")
 
             prompt, use_search, source_files_for_call = await make_ai_contents(
                 topic=topic,
@@ -1450,7 +1460,7 @@ async def generate_questions(
                 batch_size = min(8, remaining)
 
             if progress_callback and generated:
-                await progress_callback(f"Ã¢Å“â€¦ {len(generated)}/{count} valid questions are readyÃ¢â‚¬Â¦")
+                await progress_callback(f" {len(generated)}/{count} valid questions are ready...")
 
             if not candidates:
                 break
@@ -1481,7 +1491,7 @@ def admin_only(func):
         if not update.effective_user or not is_admin(update.effective_user.id):
             if update.effective_message:
                 await update.effective_message.reply_text(
-                    "Ã°Å¸â€œÅ¡ Quiz creation is available only to the Owner/authorized Admins."
+                    " Quiz creation is available only to the Owner/authorized Admins."
                 )
             return ConversationHandler.END
         return await func(update, context)
@@ -1501,7 +1511,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if not is_admin(user.id):
         await message.reply_text(
-            "Ã°Å¸â€œÅ¡ ECA QUIZ MAKER\n\n"
+            "ECA QUIZ MAKER\n\n"
             "Quiz creation is available only to the Owner/authorized Admins."
         )
         return ConversationHandler.END
@@ -1512,7 +1522,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         with SessionLocal() as session:
             quiz = session.get(Quiz, quiz_id)
         if not quiz:
-            await message.reply_text("Ã¢ÂÅ’ This quiz link is invalid or the prepared quiz is no longer available.")
+            await message.reply_text("Error: This quiz link is invalid or the prepared quiz is no longer available.")
             return ConversationHandler.END
 
         context.user_data["prepared_quiz_id"] = quiz_id
@@ -1525,23 +1535,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             context.user_data["run_mode"] = "group"
             context.user_data["target_chat_id"] = message.chat.id
             await message.reply_text(
-                "Ã°Å¸Å½Â¯ QUIZ READY\n\n"
-                f"Ã°Å¸â€œÅ¡ Topic: {quiz.title}\n"
-                f"Ã°Å¸â€Â¢ Questions: {quiz.question_count}\n"
-                f"Ã°Å¸Å’Â Language: {quiz.language}\n\n"
-                "Ã¢ÂÂ±Ã¯Â¸Â Choose the time allowed for each question:",
+                " QUIZ READY\n\n"
+                f" Topic: {quiz.title}\n"
+                f" Questions: {quiz.question_count}\n"
+                f" Language: {quiz.language}\n\n"
+                "Time: Choose the time allowed for each question:",
                 reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
             )
             return STATE_GROUP_START_TIME
 
         await message.reply_text(
-            "Ã°Å¸Å½Â¯ QUIZ READY\n\n"
-            f"Ã°Å¸â€œÅ¡ Topic: {quiz.title}\n"
-            f"Ã°Å¸â€Â¢ Questions: {quiz.question_count}\n"
-            f"Ã°Å¸Å’Â Language: {quiz.language}\n\n"
+            " QUIZ READY\n\n"
+            f" Topic: {quiz.title}\n"
+            f" Questions: {quiz.question_count}\n"
+            f" Language: {quiz.language}\n\n"
             "The quiz is prepared but not published yet. Choose where to start it:",
             reply_markup=ReplyKeyboardMarkup(
-                [["Ã°Å¸â€˜Â¤ Personally", "Ã°Å¸â€˜Â¥ Group"]],
+                [["Personally", "Group"]],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             ),
@@ -1549,7 +1559,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return STATE_START_LOCATION
 
     await message.reply_text(
-        "Ã°Å¸â€œÅ¡ ETERNAL CIVIL ACADEMY\n"
+        "ETERNAL CIVIL ACADEMY\n"
         "QUIZ MAKER\n\n"
         "What would you like to do?",
         reply_markup=ReplyKeyboardMarkup(
@@ -1566,7 +1576,7 @@ async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     choice = update.effective_message.text.strip()
 
-    if choice == "Ã°Å¸Â¤â€“ AI Generate Questions":
+    if choice == "AI Generate Questions":
         context.user_data["mode"] = "ai"
         await update.effective_message.reply_text(
             "Enter the topic.\n\n"
@@ -1574,7 +1584,7 @@ async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         return STATE_TOPIC
 
-    if choice == "Ã°Å¸â€œÅ¡ I Will Provide Source":
+    if choice == "I Will Provide Source":
         context.user_data["mode"] = "source"
         await update.effective_message.reply_text(
             "Choose the source type:",
@@ -1595,11 +1605,11 @@ async def choose_source_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     choice = update.effective_message.text.strip()
     mapping = {
-        "Ã°Å¸â€œâ€ž PDF": "pdf",
-        "Ã°Å¸â€“Â¼ Photo": "photo",
-        "Ã°Å¸â€œÂ Text": "text",
-        "Ã°Å¸â€œÅ  Telegram Poll": "poll",
-        "Ã°Å¸â€â€” URL": "url",
+        "PDF": "pdf",
+        "Photo": "photo",
+        "Text": "text",
+        "Telegram Poll": "poll",
+        "URL": "url",
     }
     source_type = mapping.get(choice)
     if not source_type:
@@ -1613,18 +1623,18 @@ async def choose_source_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.effective_message.reply_text("Send an accessible webpage URL now.")
     elif source_type == "poll":
         await update.effective_message.reply_text(
-            "Forward or send Telegram Polls here. You can send more than one; press Ã¢Å“â€¦ Source Ready when finished.",
-            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+            "Forward or send Telegram Polls here. You can send more than one; press Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     elif source_type == "pdf":
         await update.effective_message.reply_text(
-            "Send the PDF files here. You can send more than one; press Ã¢Å“â€¦ Source Ready when finished.",
-            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+            "Send the PDF files here. You can send more than one; press Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     else:
         await update.effective_message.reply_text(
-            "Send clear page photos here. You can send more than one; press Ã¢Å“â€¦ Source Ready when finished.",
-            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+            "Send clear page photos here. You can send more than one; press Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     return STATE_SOURCE_CONTENT
 
@@ -1637,28 +1647,28 @@ async def receive_source_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     source_type = context.user_data.get("source_type")
 
     if source_type in ("pdf", "photo", "poll"):
-        if text == "Ã¢Å“â€¦ Source Ready":
+        if text == "Source Ready":
             if source_type in ("pdf", "photo") and not context.user_data.get("source_files"):
-                await update.effective_message.reply_text("Ã¢ÂÅ’ Send at least one file first.")
+                await update.effective_message.reply_text("Send at least one file first.")
                 return STATE_SOURCE_CONTENT
             if source_type == "poll" and not context.user_data.get("source_text"):
-                await update.effective_message.reply_text("Ã¢ÂÅ’ Send at least one Telegram Poll first.")
+                await update.effective_message.reply_text("Send at least one Telegram Poll first.")
                 return STATE_SOURCE_CONTENT
             await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
             return STATE_TOPIC
-        await update.effective_message.reply_text("Keep sending source files/polls. Press Ã¢Å“â€¦ Source Ready when finished.")
+        await update.effective_message.reply_text("Keep sending source files/polls. Press Source Ready when finished.")
         return STATE_SOURCE_CONTENT
 
     if source_type == "url":
         if not re.match(r"^https?://", text, flags=re.I):
-            await update.effective_message.reply_text("Ã¢ÂÅ’ Send a valid http/https URL.")
+            await update.effective_message.reply_text("Send a valid http/https URL.")
             return STATE_SOURCE_CONTENT
-        await update.effective_message.reply_text("Ã¢ÂÂ³ Reading URL contentÃ¢â‚¬Â¦")
+        await update.effective_message.reply_text(" Reading URL content...")
         try:
             content = await asyncio.to_thread(fetch_url_text, text)
         except Exception as exc:
             logger.exception("URL fetch failed.")
-            await update.effective_message.reply_text(f"Ã¢ÂÅ’ The URL could not be read.\n\nReason: {str(exc)[:500]}")
+            await update.effective_message.reply_text(f"The URL could not be read.\n\nReason: {str(exc)[:500]}")
             return STATE_SOURCE_CONTENT
         context.user_data["source_text"] = content
         context.user_data["source_summary"] = text
@@ -1667,7 +1677,7 @@ async def receive_source_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # plain text source
     if len(text) < 20:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ The source is too short. Please provide more source material.")
+        await update.effective_message.reply_text("The source is too short. Please provide more source material.")
         return STATE_SOURCE_CONTENT
     context.user_data["source_text"] = text[:MAX_SOURCE_TEXT]
     context.user_data["source_summary"] = "User-supplied text"
@@ -1697,36 +1707,36 @@ async def receive_source_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["source_text"] = joined[:MAX_SOURCE_TEXT]
         context.user_data["source_summary"] = "One or more Telegram Poll sources"
         await update.effective_message.reply_text(
-            "Ã¢Å“â€¦ Poll source received.\n\nYou can send more Polls. Press Ã¢Å“â€¦ Source Ready when finished.",
-            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+            " Poll source received.\n\nYou can send more Polls. Press Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
         return STATE_SOURCE_CONTENT
 
     if source_type == "pdf":
         if not update.effective_message.document or (Path(update.effective_message.document.file_name or "").suffix.lower() != ".pdf"):
-            await update.effective_message.reply_text("Ã¢ÂÅ’ PDF mode accepts PDF files only.")
+            await update.effective_message.reply_text("PDF mode accepts PDF files only.")
             return STATE_SOURCE_CONTENT
     elif source_type == "photo":
         if not update.effective_message.photo:
-            await update.effective_message.reply_text("Ã¢ÂÅ’ Photo mode accepts image files only.")
+            await update.effective_message.reply_text("Photo mode accepts image files only.")
             return STATE_SOURCE_CONTENT
     else:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Send the correct source type.")
+        await update.effective_message.reply_text("Send the correct source type.")
         return STATE_SOURCE_CONTENT
 
     try:
         path, suffix = await download_message_file(update, context)
     except Exception:
         logger.exception("File download failed.")
-        await update.effective_message.reply_text("Ã¢ÂÅ’ The file could not be received.")
+        await update.effective_message.reply_text("The file could not be received.")
         return STATE_SOURCE_CONTENT
 
     paths = context.user_data.setdefault("source_files", [])
     paths.append(path)
     context.user_data["source_summary"] = f"{len(paths)} {source_type} source file(s)"
     await update.effective_message.reply_text(
-        f"Ã¢Å“â€¦ Received {len(paths)} source file(s).\n\nYou can send more pages/files. Press Ã¢Å“â€¦ Source Ready when finished.",
-        reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
+        f" Received {len(paths)} source file(s).\n\nYou can send more pages/files. Press Source Ready when finished.",
+        reply_markup=ReplyKeyboardMarkup([["Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
     )
     return STATE_SOURCE_CONTENT
 
@@ -1736,7 +1746,7 @@ async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
     topic = update.effective_message.text.strip()
     if len(topic) < 2:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Please enter a valid topic.")
+        await update.effective_message.reply_text("Error: Please enter a valid topic.")
         return STATE_TOPIC
     context.user_data["topic"] = topic
     await update.effective_message.reply_text("How many questions do you need?\n\nEnter a number from 1 to 100.")
@@ -1749,10 +1759,10 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     try:
         count = int(update.effective_message.text.strip())
     except ValueError:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Enter a number only.")
+        await update.effective_message.reply_text("Enter a number only.")
         return STATE_COUNT
     if not 1 <= count <= MAX_QUESTIONS:
-        await update.effective_message.reply_text(f"Ã¢ÂÅ’ The number must be between 1 and {MAX_QUESTIONS}.")
+        await update.effective_message.reply_text(f"Error: The number must be between 1 and {MAX_QUESTIONS}.")
         return STATE_COUNT
     context.user_data["question_count"] = count
     await update.effective_message.reply_text(
@@ -1788,9 +1798,9 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     source_files = list(context.user_data.get("source_files", []))
 
     status = await message.reply_text(
-        "Ã¢ÂÂ³ Preparing the quizÃ¢â‚¬Â¦\n"
+        " Preparing the quiz...\n"
         "Questions will not be published yet.\n\n"
-        "Running source verification, originality, and duplicate checksÃ¢â‚¬Â¦"
+        "Running source verification, originality, and duplicate checks..."
     )
 
     async def progress(text: str) -> None:
@@ -1813,13 +1823,13 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if not questions:
             if terminal_error and "quota" in terminal_error.lower():
                 await status.edit_text(
-                    "Ã¢ÂÅ’ Gemini quota is currently unavailable.\n\n"
+                    "Error: Gemini quota is currently unavailable.\n\n"
                     "All configured Gemini models/keys returned a quota/rate-limit error.\n"
                     "The bot did not continue with fake or unchecked questions."
                 )
             else:
                 await status.edit_text(
-                    "Ã¢ÂÅ’ No valid question could be prepared.\n\n"
+                    "Error: No valid question could be prepared.\n\n"
                     "The quality/verification checks did not pass, so the quiz was not published.\n"
                     "Please make the topic/source more specific and try again."
                 )
@@ -1867,28 +1877,28 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         partial = ""
         if len(questions) < count:
             partial = (
-                f"\n\nÃ¢Å¡Â Ã¯Â¸Â Requested: {count}\n"
-                f"Ã¢Å“â€¦ Verified/valid: {len(questions)}\n"
+                f"\n\n Requested: {count}\n"
+                f" Verified/valid: {len(questions)}\n"
                 "Fewer questions were kept because quality/verification was not bypassed."
             )
             if terminal_error and "quota" in terminal_error.lower():
                 partial += "\n\nGemini quota stopped further generation."
 
         await status.edit_text(
-            "Ã¢Å“â€¦ QUIZ READY\n\n"
-            f"Ã°Å¸â€œÅ¡ Topic: {topic}\n"
-            f"Ã°Å¸â€Â¢ Questions: {len(questions)}\n"
-            f"Ã°Å¸Å’Â Language: {language}"
-            f"{partial}\n\n"
+            " QUIZ READY\n\n"
+            f" Topic: {topic}\n"
+            f" Questions: {len(questions)}\n"
+            f" Language: {language}"
+            "Prepared Quiz Link:\n"
             "Questions have not been published as a batch.\n"
             "Choose the start location first, then the time per question.\n\n"
-            f"Ã°Å¸â€â€” Prepared Quiz Link:\n{personal_link}"
+            f"Prepared Quiz Link:\n{personal_link}"
         )
 
         await message.reply_text(
-            "Ã°Å¸â€œÂ Where should the quiz start?",
+            "Where should the quiz start?",
             reply_markup=ReplyKeyboardMarkup(
-                [["Ã°Å¸â€˜Â¤ Personally", "Ã°Å¸â€˜Â¥ Group"]],
+                [["Personally", "Group"]],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             ),
@@ -1896,7 +1906,7 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return STATE_START_LOCATION
     except Exception:
         logger.exception("Quiz preparation failed.")
-        await status.edit_text("Ã¢ÂÅ’ An unexpected error occurred while preparing the quiz. Check the Render logs for technical details.")
+        await status.edit_text("An unexpected error occurred while preparing the quiz. Check the Render logs for technical details.")
         return ConversationHandler.END
     finally:
         # generate_questions() itself cleans the source file.
@@ -1914,29 +1924,29 @@ async def choose_start_location(update: Update, context: ContextTypes.DEFAULT_TY
     choice = update.effective_message.text.strip()
     quiz_id = context.user_data.get("prepared_quiz_id")
     if not quiz_id:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Prepared quiz not found. Start again with /start.")
+        await update.effective_message.reply_text("Prepared quiz not found. Start again with /start.")
         return ConversationHandler.END
 
-    if choice == "Ã°Å¸â€˜Â¤ Personally":
+    if choice == "Personally":
         if update.effective_chat.type != "private":
-            await update.effective_message.reply_text("Ã¢ÂÅ’ Personal mode must be started in the bot's private chat.")
+            await update.effective_message.reply_text("Personal mode must be started in the bot's private chat.")
             return STATE_START_LOCATION
         context.user_data["run_mode"] = "personal"
         context.user_data["target_chat_id"] = update.effective_chat.id
 
         await update.effective_message.reply_text(
-            "Ã¢ÂÂ±Ã¯Â¸Â Choose the time allowed for each question.\n\n"
+            "Choose the time allowed for each question.\n\n"
             "The next question will start automatically when the time ends.",
             reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
         )
         return STATE_TIME
 
-    if choice == "Ã°Å¸â€˜Â¥ Group":
+    if choice == "Group":
         if update.effective_chat.type in ("group", "supergroup"):
             context.user_data["run_mode"] = "group"
             context.user_data["target_chat_id"] = update.effective_chat.id
             await update.effective_message.reply_text(
-                "Ã¢ÂÂ±Ã¯Â¸Â Choose the time allowed for each question.",
+                "Choose the time allowed for each question.",
                 reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
             )
             return STATE_TIME
@@ -1944,9 +1954,9 @@ async def choose_start_location(update: Update, context: ContextTypes.DEFAULT_TY
         bot = await context.bot.get_me()
         group_link = f"https://t.me/{bot.username}?startgroup=quiz_{quiz_id}"
         await update.effective_message.reply_text(
-            "Ã°Å¸â€˜Â¥ Group mode selected.\n\n"
+            "Group mode selected.\n\n"
             "Add the bot to the group where you want to run the quiz and use the link below.\n\n"
-            f"Ã°Å¸â€â€” Group Start Link:\n{group_link}\n\n"
+            f"Group Start Link:\n{group_link}\n\n"
             "When the quiz starts in the group, the timer will be selected there.",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -1984,7 +1994,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
     target_chat_id = context.user_data.get("target_chat_id")
 
     if not quiz_id or mode not in ("personal", "group") or not target_chat_id:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ Quiz run details are incomplete. Start again with /start.")
+        await update.effective_message.reply_text("Quiz run details are incomplete. Start again with /start.")
         return ConversationHandler.END
 
     # Make sure quiz still exists and has questions.
@@ -1992,7 +2002,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         quiz = session.get(Quiz, quiz_id)
         q_count = session.scalar(select(QuizQuestion.id).where(QuizQuestion.quiz_id == quiz_id).limit(1))
     if not quiz or q_count is None:
-        await update.effective_message.reply_text("Ã¢ÂÅ’ This prepared quiz is no longer available.")
+        await update.effective_message.reply_text("This prepared quiz is no longer available.")
         return ConversationHandler.END
 
     run_id = f"{quiz_id}-run-{uuid.uuid4().hex[:18]}"
@@ -2014,10 +2024,10 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         session.commit()
 
     await update.effective_message.reply_text(
-        "Ã°Å¸Å¡â‚¬ QUIZ STARTING\n\n"
-        f"Ã¢ÂÂ±Ã¯Â¸Â Time per question: {seconds} seconds\n"
-        "Ã¢Å¾Â¡Ã¯Â¸Â The next question starts automatically when time expires.\n"
-        "Ã¢ÂÅ’ Questions will not be sent all at once.",
+        " QUIZ STARTING\n\n"
+        f"Time: Time per question: {seconds} seconds\n"
+        "Info: The next question starts automatically when time expires.\n"
+        "Error: Questions will not be sent all at once.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -2026,7 +2036,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         await send_next_question(context, run_id)
     except Exception:
         logger.exception("Initial quiz question failed for run=%s", run_id)
-        await update.effective_message.reply_text("Ã¢ÂÅ’ The quiz could not be started.")
+        await update.effective_message.reply_text("The quiz could not be started.")
     return ConversationHandler.END
 
 
@@ -2062,7 +2072,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             await safe_send_message(
                 context.bot,
                 target_chat_id,
-                "Ã°Å¸ÂÂ QUIZ COMPLETED\n\n"
+                "QUIZ COMPLETED\n\n"
                 "All questions have been completed.\n\n"
                 f"{completed_text}",
             )
@@ -2076,7 +2086,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             await safe_send_message(
                 context.bot,
                 run.target_chat_id,
-                f"Ã¢ÂÅ’ Question {next_no} could not be published because its stored options are invalid.",
+                f"Error: Question {next_no} could not be published because its stored options are invalid.",
             )
             return
 
@@ -2101,7 +2111,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             correct_option_id=correct_index,
             explanation=explanation[:200],
             description=(
-                f"Ã°Å¸â€œÅ¡ ECA QUIZ | {topic}\n"
+                f" ECA QUIZ | {topic}\n"
                 f"Question {next_no}\n\n"
                 f"{SOURCE_FOOTER}"
             )[:1024],
@@ -2123,7 +2133,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             correct_option_id=correct_index,
             explanation=explanation[:200],
             description=(
-                f"Ã°Å¸â€œÅ¡ ECA QUIZ | {topic}\n"
+                f" ECA QUIZ | {topic}\n"
                 f"Question {next_no}\n\n"
                 f"{SOURCE_FOOTER}"
             )[:1024],
@@ -2139,7 +2149,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
         await safe_send_message(
             context.bot,
             target,
-            "Ã¢ÂÅ’ Telegram rejected the quiz poll.\n\n"
+            "Telegram rejected the quiz poll.\n\n"
             "Give the bot the required group permissions, or try Personal mode.",
         )
         return
@@ -2166,13 +2176,29 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
         run.current_question = next_no
         session.commit()
 
-    if context.job_queue:
-        context.job_queue.run_once(
-            send_next_question_job,
-            when=interval + 0.5,
-            data={"run_id": run_id},
-            name=f"eca-next-{run_id}-{next_no}",
+    if context.job_queue is None:
+        logger.error(
+            "JobQueue is unavailable. Install python-telegram-bot[job-queue] "
+            "so the next question can be scheduled."
         )
+        with SessionLocal() as session:
+            run = session.get(QuizRun, run_id)
+            if run:
+                run.active = False
+                session.commit()
+        await safe_send_message(
+            context.bot,
+            target,
+            "The quiz scheduler is unavailable. Please redeploy with the required JobQueue package.",
+        )
+        return
+
+    context.job_queue.run_once(
+        send_next_question_job,
+        when=interval + 0.5,
+        data={"run_id": run_id},
+        name=f"eca-next-{run_id}-{next_no}",
+    )
 
 
 async def send_next_question_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2304,7 +2330,7 @@ def build_leaderboard(run_id: str) -> str:
         previous_correct = correct_key
 
     lines = [
-        "Ã°Å¸Ââ€  ECA LIVE QUIZ Ã¢â‚¬â€ LEADERBOARD",
+        " ECA LIVE QUIZ - LEADERBOARD",
         "",
         f"Quiz: {repair_mojibake(quiz.title)}",
         "",
@@ -2315,13 +2341,13 @@ def build_leaderboard(run_id: str) -> str:
         return "\n".join(lines)
 
     for row in rows[:50]:
-        # Requested compact format: Ã¢Å“â€¦right Ã¢ÂÅ’wrong Ã¢Â­â€¢unattempted [Raw marksÃ¢â‚¬â€X] rank
+        # Requested compact format: right Error:wrong â­•unattempted [Raw marks-X] rank
         raw = row["raw_marks"]
         raw_text = f"{raw:.2f}".rstrip("0").rstrip(".")
         lines.append(
-            f"{row['name'][:45]} ({row['user_id']}) Ã¢â‚¬â€ "
-            f"Ã¢Å“â€¦{row['correct']} Ã¢ÂÅ’{row['wrong']} Ã¢Â­â€¢{row['unattempted']} "
-            f"[Raw marksÃ¢â‚¬â€{raw_text}] {row['rank']}"
+            f"{row['name'][:45]} ({row['user_id']}) - "
+            f"{row['correct']} Error:{row['wrong']} â­•{row['unattempted']} "
+            f"[Raw marks-{raw_text}] {row['rank']}"
         )
 
     return "\n".join(lines)
@@ -2387,7 +2413,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cleanup_file(context.user_data.get("source_file"))
     context.user_data.clear()
     await update.effective_message.reply_text(
-        "Ã¢ÂÅ’ Operation cancelled.",
+        "Operation cancelled.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
@@ -2395,17 +2421,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Ã°Å¸â€œÅ¡ ECA QUIZ MAKER\n\n"
-        "/start Ã¢â‚¬â€ Quiz Maker\n"
-        "/cancel Ã¢â‚¬â€ Cancel current operation\n"
-        "/whoami Ã¢â‚¬â€ Show Telegram User ID\n\n"
+        "ECA QUIZ MAKER\n\n"
+        "/start - Quiz Maker\n"
+        "/cancel - Cancel current operation\n"
+        "/whoami - Show Telegram User ID\n\n"
         "OWNER COMMANDS\n"
-        "/addadmin Ã¢â‚¬â€ reply to a user message\n"
-        "/removeadmin Ã¢â‚¬â€ reply to an admin message\n"
-        "/admins Ã¢â‚¬â€ Show admin list\n\n"
+        "/addadmin - reply to a user message\n"
+        "/removeadmin - reply to an admin message\n"
+        "/admins - Show admin list\n\n"
         "MAIN MODES\n"
-        "Ã°Å¸Â¤â€“ AI Generate Questions\n"
-        "Ã°Å¸â€œÅ¡ I Will Provide Source"
+        "AI Generate Questions\n"
+        "I Will Provide Source"
     )
 
 
