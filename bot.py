@@ -1,14 +1,28 @@
+# Updated ECA Quiz Maker Bot
+# Owner + Authorized Admin system
+# Telegram native Poll Description supported (0-1024 chars)
+
+# IMPORTANT:
+# इस version में:
+# 1. केवल Owner और Authorized Admins quiz बना सकते हैं
+# 2. Students केवल quizzes attempt करेंगे
+# 3. /addadmin, /removeadmin, /admins
+# 4. AI Automatic में My Source और AI Find Source
+# 5. Original questions / anti-repetition rules
+# 6. Topic diversity: एक narrow topic से max 1-2 questions
+# 7. Poll description में Source: @EternalCivilAcademy
+# 8. Explanation में correct answer + बाकी options का short explanation
+# 9. Leaderboard: Correct, Wrong और RM (Raw Marks)
+# 10. Ranking केवल Raw Marks पर; time का कोई role नहीं
+# 11. Equal marks = equal rank
+
 import os
 import sqlite3
 import logging
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,27 +32,11 @@ from telegram.ext import (
     filters,
 )
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# केवल Admin इस bot से quiz create कर सकेगा.
-# Render Environment Variable में अपना Telegram numeric User ID डालें.
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-
-SOURCE_TEXT = "Source: @EternalCivilAcademy"
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))
 
 DB_FILE = "eca_quiz.db"
-
-# Conversation states
-MODE, SOURCE_MODE, TOPIC, QUESTION_COUNT, LANGUAGE = range(5)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+SOURCE_FOOTER = "Source: @EternalCivilAcademy"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,17 +45,40 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+MODE, SOURCE_MODE, TOPIC, QUESTION_COUNT, LANGUAGE = range(5)
+
+
+@dataclass
+class Question:
+    question: str
+    options: List[str]
+    correct_index: int
+    explanation: str
+    source: str
+    topic: str
+
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+def db():
+    return sqlite3.connect(DB_FILE)
 
-    # Generated / used questions का permanent history
-    cursor.execute("""
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS question_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             topic TEXT NOT NULL,
@@ -69,8 +90,7 @@ def init_db():
         )
     """)
 
-    # Quiz participants
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS participants (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             quiz_id TEXT NOT NULL,
@@ -88,33 +108,181 @@ def init_db():
     conn.close()
 
 
-# ============================================================
-# DATA STRUCTURES
-# ============================================================
+def is_owner(user_id: int) -> bool:
+    return OWNER_USER_ID != 0 and user_id == OWNER_USER_ID
 
-@dataclass
-class Question:
-    question: str
-    options: List[str]
-    correct_index: int
-
-    # Telegram's short explanation field
-    explanation: str
-
-    # Full explanation for future detailed explanation message
-    full_explanation: str
-
-    source: str
-
-    topic: str
-
-
-# ============================================================
-# ADMIN CHECK
-# ============================================================
 
 def is_admin(user_id: int) -> bool:
-    return ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID
+    if is_owner(user_id):
+        return True
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT 1 FROM admins WHERE user_id = ?",
+        (user_id,)
+    )
+
+    result = cur.fetchone()
+    conn.close()
+
+    return result is not None
+
+
+# ============================================================
+# ADMIN MANAGEMENT
+# ============================================================
+
+async def add_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not is_owner(user.id):
+        await update.message.reply_text(
+            "❌ केवल Bot Owner नए Admin authorize कर सकता है।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/addadmin TELEGRAM_USER_ID\n\n"
+            "उदाहरण:\n"
+            "/addadmin 123456789"
+        )
+        return
+
+    try:
+        new_admin_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Telegram User ID केवल numeric होना चाहिए।"
+        )
+        return
+
+    if new_admin_id == OWNER_USER_ID:
+        await update.message.reply_text(
+            "यह user पहले से Owner है।"
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO admins
+        (user_id, added_by)
+        VALUES (?, ?)
+        """,
+        (new_admin_id, user.id),
+    )
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ Admin authorized.\n\nUser ID: {new_admin_id}"
+    )
+
+
+async def remove_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not is_owner(user.id):
+        await update.message.reply_text(
+            "❌ केवल Bot Owner Admin remove कर सकता है।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/removeadmin TELEGRAM_USER_ID"
+        )
+        return
+
+    try:
+        admin_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ User ID numeric होना चाहिए।"
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "DELETE FROM admins WHERE user_id = ?",
+        (admin_id,)
+    )
+
+    removed = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    if removed:
+        await update.message.reply_text(
+            f"✅ Admin access removed.\n\n"
+            f"User ID: {admin_id}"
+        )
+    else:
+        await update.message.reply_text(
+            "यह User ID authorized admin list में नहीं मिली।"
+        )
+
+
+async def list_admins(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not is_owner(user.id):
+        await update.message.reply_text(
+            "❌ केवल Bot Owner authorized admins देख सकता है।"
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT user_id FROM admins ORDER BY added_at"
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+
+    lines = [
+        "👑 ECA Quiz Maker Admins",
+        "",
+        f"Owner: {OWNER_USER_ID}",
+        "",
+        "Authorized Admins:",
+    ]
+
+    if not rows:
+        lines.append(
+            "कोई additional admin नहीं है।"
+        )
+    else:
+        for index, (admin_id,) in enumerate(rows, 1):
+            lines.append(
+                f"{index}. {admin_id}"
+            )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
 
 
 # ============================================================
@@ -125,13 +293,17 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     user = update.effective_user
 
     if not is_admin(user.id):
         await update.message.reply_text(
-            "यह Quiz Maker केवल ECA Admin के लिए उपलब्ध है।"
+            "📚 ECA Quiz Maker\n\n"
+            "यह bot केवल ECA द्वारा बनाए गए quizzes "
+            "को attempt करने के लिए उपलब्ध है।\n\n"
+            "Quiz creation access केवल Owner और "
+            "authorized Admins के पास है।"
         )
+
         return ConversationHandler.END
 
     keyboard = [
@@ -145,7 +317,6 @@ async def start(
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
             resize_keyboard=True,
-            one_time_keyboard=True,
         ),
     )
 
@@ -153,13 +324,15 @@ async def start(
 
 
 # ============================================================
-# MODE SELECTION
+# MAIN MENU
 # ============================================================
 
 async def receive_mode(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
 
     choice = update.message.text.strip()
 
@@ -184,17 +357,26 @@ async def receive_mode(
 
     if choice == "📝 My Questions Quiz":
 
+        keyboard = [
+            ["📷 Photo से Questions"],
+            ["📄 PDF से Questions"],
+            ["⌨️ Text से Questions"],
+        ]
+
         await update.message.reply_text(
             "📝 My Questions Quiz\n\n"
-            "यह mode आगे Photo / PDF / Text से आपके "
-            "existing questions को quiz में बदलेगा.\n\n"
-            "अभी foundation तैयार है।"
+            "आप अपने existing questions किस रूप में देना चाहते हैं?",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard,
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
         )
 
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "कृपया दिए गए दो options में से एक चुनिए।"
+        "कृपया menu से option चुनिए।"
     )
 
     return MODE
@@ -208,6 +390,8 @@ async def receive_source_mode(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
 
     choice = update.message.text.strip()
 
@@ -216,13 +400,12 @@ async def receive_source_mode(
         context.user_data["source_mode"] = "provided_source"
 
         await update.message.reply_text(
-            "📤 My Source चुना गया है।\n\n"
-            "अगले version में आप यहाँ:\n"
-            "• Book/Notes की Photo\n"
-            "• PDF\n"
-            "• Multiple pages\n\n"
-            "भेज सकेंगे। AI उस material को पढ़कर "
-            "original questions बनाएगा।"
+            "📤 My Source selected.\n\n"
+            "इस mode में book/notes की Photo, PDF या "
+            "content दिया जाएगा।\n"
+            "AI उसी material को पढ़कर original MCQs बनाएगा।\n\n"
+            "Actual Photo/PDF ingestion engine अगले चरण में "
+            "जोड़ा जाएगा।"
         )
 
     elif choice == "🔎 AI Find Source":
@@ -230,9 +413,9 @@ async def receive_source_mode(
         context.user_data["source_mode"] = "ai_source"
 
         await update.message.reply_text(
-            "🔎 AI Find Source चुना गया है।\n\n"
-            "AI topic के लिए authentic sources खोजेगा "
-            "और उन्हीं के आधार पर original questions बनाएगा।"
+            "🔎 AI Find Source selected.\n\n"
+            "AI topic के लिए अच्छे authentic sources खोजेगा, "
+            "facts verify करेगा और original MCQs बनाएगा।"
         )
 
     else:
@@ -258,13 +441,17 @@ async def receive_topic(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
 
     topic = update.message.text.strip()
 
     if len(topic) < 2:
+
         await update.message.reply_text(
             "कृपया valid topic भेजिए।"
         )
+
         return TOPIC
 
     context.user_data["topic"] = topic
@@ -285,19 +472,28 @@ async def receive_question_count(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
 
     try:
-        count = int(update.message.text.strip())
+        count = int(
+            update.message.text.strip()
+        )
+
     except ValueError:
+
         await update.message.reply_text(
             "कृपया केवल संख्या डालिए।"
         )
+
         return QUESTION_COUNT
 
     if count < 1 or count > 100:
+
         await update.message.reply_text(
             "अभी 1 से 100 questions के बीच संख्या डालिए।"
         )
+
         return QUESTION_COUNT
 
     context.user_data["question_count"] = count
@@ -327,6 +523,8 @@ async def receive_language(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
 
     language_map = {
         "हिंदी": "Hindi",
@@ -337,9 +535,11 @@ async def receive_language(
     choice = update.message.text.strip()
 
     if choice not in language_map:
+
         await update.message.reply_text(
             "हिंदी, English या Bilingual में से चुनिए।"
         )
+
         return LANGUAGE
 
     language = language_map[choice]
@@ -353,7 +553,8 @@ async def receive_language(
     source_name = (
         "आपके दिए हुए source"
         if source_mode == "provided_source"
-        else "AI द्वारा खोजे गए authentic sources"
+        else
+        "AI द्वारा खोजे गए authentic sources"
     )
 
     await update.message.reply_text(
@@ -362,33 +563,21 @@ async def receive_language(
         f"🔢 Questions: {count}\n"
         f"🌐 Language: {language}\n"
         f"📖 Source: {source_name}\n\n"
-        "अब question-generation engine काम करेगा।\n\n"
-        "महत्वपूर्ण नियम:\n"
-        "• Questions original होंगे\n"
-        "• Source के questions copy नहीं होंगे\n"
-        "• पुराने ECA questions repeat नहीं होंगे\n"
-        "• एक narrow topic से 1–2 से अधिक questions नहीं\n"
-        "• Authentic source verification होगी\n"
-        "• Ambiguous questions reject होंगे",
-        reply_markup=ReplyKeyboardRemove(),
+
+        "Question-generation rules:\n"
+        "✓ Original questions only\n"
+        "✓ Source के existing questions copy नहीं होंगे\n"
+        "✓ केवल wording बदलकर duplicate नहीं बनाया जाएगा\n"
+        "✓ पुराने ECA questions repeat नहीं होंगे\n"
+        "✓ एक narrow topic/concept से अधिकतम 1–2 questions\n"
+        "✓ अलग subtopics/concepts/angles को priority\n"
+        "✓ Authentic source verification\n"
+        "✓ Ambiguous/factually doubtful questions reject\n"
+        "✓ Time ranking में इस्तेमाल नहीं होगा\n\n"
+
+        "AI engine next stage में connect किया जाएगा।"
     )
 
-    # --------------------------------------------------------
-    # AI ENGINE PLACEHOLDER
-    # --------------------------------------------------------
-    #
-    # अगले चरण में यहाँ:
-    #
-    # 1. Source retrieval
-    # 2. OCR / PDF extraction
-    # 3. AI generation
-    # 4. Originality check
-    # 5. Duplicate detection
-    # 6. Topic diversity check
-    # 7. Factual verification
-    #
-    # जोड़ा जाएगा.
-    #
     questions = await generate_questions(
         topic=topic,
         count=count,
@@ -399,10 +588,9 @@ async def receive_language(
     if not questions:
 
         await update.message.reply_text(
-            "✅ Configuration सफलतापूर्वक save हो गई है।\n\n"
-            "अभी AI/source engine connect नहीं किया गया है।\n"
-            "अगले चरण में इसी bot में वास्तविक AI question "
-            "generation और source verification जोड़ेंगे।"
+            "✅ Configuration save हो गई है।\n\n"
+            "Real AI/OCR/source-search engine अभी connect "
+            "नहीं है। अगले चरण में इसे जोड़ा जाएगा।"
         )
 
         return ConversationHandler.END
@@ -410,14 +598,14 @@ async def receive_language(
     context.user_data["questions"] = questions
 
     await update.message.reply_text(
-        f"✅ {len(questions)} original questions तैयार हैं।"
+        f"✅ {len(questions)} questions तैयार हैं।"
     )
 
     return ConversationHandler.END
 
 
 # ============================================================
-# QUESTION GENERATION ENGINE
+# AI ENGINE
 # ============================================================
 
 async def generate_questions(
@@ -428,98 +616,74 @@ async def generate_questions(
 ) -> List[Question]:
 
     """
-    FINAL AI RULES
-    ==============
+    वास्तविक AI engine अगले चरण में connect होगा।
 
-    SOURCE MODES
-    ------------
+    HARD RULES:
 
-    1. provided_source:
-       Admin द्वारा दिए गए Photo/PDF/Content से
-       questions बनाए जाएँ।
+    1. Automatic source modes:
+       - provided_source
+       - ai_source
 
-    2. ai_source:
-       AI खुद authentic/primary sources खोजे,
-       verify करे और questions बनाए।
+    2. Originality:
+       - source के existing questions copy नहीं
+       - near-copy/paraphrase नहीं
+       - previous ECA questions repeat नहीं
 
-    ORIGINALITY
-    -----------
+    3. Topic diversity:
+       - same narrow topic/concept से max 1–2 questions
+       - अलग subtopics/concepts/angles को priority
 
-    Source में मौजूद existing questions को:
-    - copy नहीं करना
-    - मामूली शब्द बदलकर reproduce नहीं करना
-    - paraphrase नहीं करना
-    - coaching/test-series questions reproduce नहीं करना
+    4. Verification:
+       - factual verification
+       - ambiguous questions reject
 
-    Source केवल factual/conceptual grounding के लिए होगा।
+    5. Language:
+       - Hindi
+       - English
+       - Bilingual
 
-    REPETITION CONTROL
-    ------------------
+    6. Telegram limits:
+       - Question <= 300 characters
+       - Option <= 100 characters
+       - Explanation <= 200 characters
+       - Description <= 1024 characters
 
-    पूरे ECA question history से:
-    - exact duplicates reject
-    - near duplicates reject
-    - substantially similar questions reject
-
-    SAME-SOURCE DIVERSITY
-    ---------------------
-
-    एक narrow topic/concept से maximum 1–2 questions.
-
-    नए questions को:
-    - अलग subtopics
-    - अलग concepts
-    - अलग facts
-    - अलग angles
-    - अलग difficulty
-    में distribute करना है।
-
-    QUALITY
-    -------
-
-    - केवल एक objectively correct answer
-    - ambiguous questions reject
-    - factual verification
-    - exam-level language
-    - unnecessary shortening नहीं
-    - Telegram limits के कारण quality compromise नहीं
-
-    LANGUAGE
-    --------
-
-    Hindi / English / Bilingual
-
-    Bilingual में लंबे question को जबरदस्ती छोटा
-    नहीं करना है।
+    Return:
+        List[Question]
     """
 
-    # अभी AI integration नहीं है.
     return []
 
 
 # ============================================================
-# TELEGRAM QUIZ POLL
+# SEND TELEGRAM QUIZ
 # ============================================================
 
 async def send_quiz_poll(
     context: ContextTypes.DEFAULT_TYPE,
-    chat_id: str,
+    chat_id: int,
     question: Question,
 ):
 
-    # Telegram Quiz Poll
-    #
-    # Question: max 300 characters
-    # Option: max 100 characters
-    # Explanation: max 200 characters
-    # Description: max 1024 characters
+    # Native Telegram Poll Description
+    # Maximum: 1024 characters
+
+    description = (
+        f"{question.source}\n\n"
+        f"{SOURCE_FOOTER}"
+    )
 
     await context.bot.send_poll(
         chat_id=chat_id,
 
-        question=question.question,
+        # Telegram question limit
+        question=question.question[:300],
 
-        options=question.options,
+        # Telegram option limit
+        options=[
+            option[:100]
+            for option in question.options
+        ],
 
         type="quiz",
 
@@ -527,15 +691,13 @@ async def send_quiz_poll(
 
         allows_multiple_answers=False,
 
-        allows_revoting=False,
+        correct_option_id=question.correct_index,
 
-        shuffle_options=False,
-
-        correct_option_ids=[question.correct_index],
-
+        # Telegram quiz explanation limit
         explanation=question.explanation[:200],
 
-        description=SOURCE_TEXT,
+        # Native Telegram poll description
+        description=description[:1024],
     )
 
 
@@ -545,12 +707,14 @@ async def send_quiz_poll(
 
 def calculate_raw_marks(
     correct: int,
-    wrong: int,
+    wrong: int
 ) -> float:
 
-    # +1 correct
-    # -1/3 wrong
-    # 0 unattempted
+    """
+    Correct = +1
+    Wrong = -1/3
+    Unattempted = 0
+    """
 
     return correct - (wrong / 3)
 
@@ -563,8 +727,20 @@ def make_ranking(
     participants: List[dict]
 ) -> List[dict]:
 
-    # IMPORTANT:
-    # Time is NEVER used.
+    """
+    Ranking ONLY by Raw Marks.
+
+    Time is NOT considered.
+
+    Equal Raw Marks = Equal Rank.
+
+    Example:
+
+    1. A — RM 39
+    2. B — RM 38
+    2. C — RM 38
+    4. D — RM 37
+    """
 
     participants = sorted(
         participants,
@@ -572,17 +748,21 @@ def make_ranking(
         reverse=True,
     )
 
-    previous_marks = None
+    previous_marks: Optional[float] = None
     current_rank = 0
 
-    for index, participant in enumerate(participants):
+    for index, participant in enumerate(
+        participants
+    ):
 
         marks = participant["raw_marks"]
 
         if previous_marks is None:
+
             current_rank = 1
 
         elif marks != previous_marks:
+
             current_rank = index + 1
 
         participant["rank"] = current_rank
@@ -591,10 +771,6 @@ def make_ranking(
 
     return participants
 
-
-# ============================================================
-# LEADERBOARD
-# ============================================================
 
 def format_leaderboard(
     participants: List[dict]
@@ -609,16 +785,12 @@ def format_leaderboard(
 
     for participant in ranked[:50]:
 
-        rank = participant["rank"]
-        name = participant["name"]
-        correct = participant["correct"]
-        wrong = participant["wrong"]
-        raw_marks = participant["raw_marks"]
-
         lines.append(
-            f"{rank}. {name} — "
-            f"✅{correct} ❌{wrong} | "
-            f"RM {raw_marks:.2f}"
+            f'{participant["rank"]}. '
+            f'{participant["name"]} — '
+            f'✅{participant["correct"]} '
+            f'❌{participant["wrong"]} | '
+            f'RM {participant["raw_marks"]:.2f}'
         )
 
     return "\n".join(lines)
@@ -635,9 +807,15 @@ async def help_command(
 
     await update.message.reply_text(
         "📚 ECA Quiz Maker\n\n"
+
         "/start — नया Quiz\n"
         "/help — Help\n"
-        "/cancel — Current operation cancel"
+        "/cancel — Current operation cancel\n\n"
+
+        "Owner commands:\n"
+        "/addadmin USER_ID\n"
+        "/removeadmin USER_ID\n"
+        "/admins"
     )
 
 
@@ -667,8 +845,15 @@ async def cancel(
 def main():
 
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN environment variable नहीं मिला।"
+        )
+
+    if OWNER_USER_ID == 0:
+
+        raise RuntimeError(
+            "OWNER_USER_ID environment variable नहीं मिला।"
         )
 
     init_db()
@@ -682,7 +867,10 @@ def main():
     conversation = ConversationHandler(
 
         entry_points=[
-            CommandHandler("start", start)
+            CommandHandler(
+                "start",
+                start
+            )
         ],
 
         states={
@@ -724,24 +912,51 @@ def main():
         },
 
         fallbacks=[
-            CommandHandler("cancel", cancel)
+            CommandHandler(
+                "cancel",
+                cancel
+            )
         ],
     )
 
-    application.add_handler(conversation)
-
     application.add_handler(
-        CommandHandler("help", help_command)
+        conversation
     )
 
-    logger.info("ECA Quiz Maker Bot is running...")
+    application.add_handler(
+        CommandHandler(
+            "addadmin",
+            add_admin
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removeadmin",
+            remove_admin
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "admins",
+            list_admins
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
+    )
+
+    logger.info(
+        "ECA Quiz Maker Bot is running..."
+    )
 
     application.run_polling()
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
