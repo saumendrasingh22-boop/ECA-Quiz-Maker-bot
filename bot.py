@@ -1063,11 +1063,14 @@ def _generate_with_client( client: genai.Client, model_name: str, prompt: str, u
         "tools": tools or None,
     }
 
-    # Gemini 2.5 can use Google Search grounding, but structured-output
-    # schema enforcement cannot be combined with built-in tools. Keep the
-    # schema for source mode and use JSON MIME output for AI/search mode.
-    config_kwargs["response_mime_type"] = "application/json"
+    # Source mode can use Gemini structured output directly. AI/search mode
+    # intentionally uses plain text JSON: built-in Google Search grounding
+    # must not be combined with legacy structured-output enforcement on
+    # Gemini 2.5. The prompt still requires one exact JSON object, and the
+    # parser below accepts minor Markdown wrapping without weakening quiz
+    # validation.
     if not use_search:
+        config_kwargs["response_mime_type"] = "application/json"
         config_kwargs["response_schema"] = QUESTION_SCHEMA
 
     config = types.GenerateContentConfig(**config_kwargs)
@@ -1116,7 +1119,41 @@ def _generate_with_client( client: genai.Client, model_name: str, prompt: str, u
 
         raise RuntimeError("Gemini returned a response that could not be parsed as JSON.")
 
-    return parse_json_response(text)
+    data = parse_json_response(text)
+
+    # AI/search mode may return the factual source evidence in grounding
+    # metadata rather than repeating it inside every JSON item. Convert a
+    # defensible subset of that metadata into a compact source label so the
+    # existing source requirement remains intact. No source URLs are invented.
+    if use_search:
+        grounding_titles: list[str] = []
+        try:
+            for candidate in getattr(response, "candidates", []) or []:
+                metadata = getattr(candidate, "grounding_metadata", None)
+                for chunk in getattr(metadata, "grounding_chunks", []) or []:
+                    web_data = getattr(chunk, "web", None)
+                    title = getattr(web_data, "title", None) if web_data else None
+                    uri = getattr(web_data, "uri", None) if web_data else None
+                    label = title or uri
+                    if label and label not in grounding_titles:
+                        grounding_titles.append(str(label))
+        except Exception:
+            logger.debug("Could not extract Gemini grounding metadata.", exc_info=True)
+
+        fallback_source = "Google Search grounding"
+        if grounding_titles:
+            fallback_source = "Google Search grounding: " + "; ".join(grounding_titles[:3])
+
+        items = data.get("questions")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    if not str(item.get("source", "")).strip():
+                        item["source"] = fallback_source
+                    if not str(item.get("topic", "")).strip():
+                        item["topic"] = "AI-generated topic"
+
+    return data
 
 
 async def call_ai( prompt: str, use_search: bool, source_files: Optional[list[str]] = None, ) -> dict[str, Any]:
@@ -1700,10 +1737,12 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     "The bot did not continue with fake or unchecked questions."
                 )
             else:
+                detail = terminal_error or "The AI response was empty or failed the validation checks."
+                detail = repair_mojibake(detail)[:900]
                 await status.edit_text(
                     "Error: No valid question could be prepared.\n\n"
-                    "The quality/verification checks did not pass, so the quiz was not published.\n"
-                    "Please make the topic/source more specific and try again."
+                    "The quality/verification checks did not pass, so the quiz was not published.\n\n"
+                    f"Reason: {detail}"
                 )
             return ConversationHandler.END
 
