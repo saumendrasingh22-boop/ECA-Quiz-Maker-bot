@@ -80,7 +80,11 @@ from telegram.ext import (
 #   Strict validation
 #
 # Quiz:
-#   Native Telegram quiz polls
+#   Prepare quiz first â€” DO NOT publish all questions at once
+#   Choose Personally / Group
+#   Choose 15 sec / 25 sec / 30 sec / 1 min per question
+#   Send exactly one native Telegram quiz poll at a time
+#   Automatically advance after selected interval
 #   Native poll description with ECA source
 #   Correct / wrong tracking
 #   -1/3 negative marking
@@ -296,6 +300,88 @@ class QuizPoll(Base):
     )
     question_text: Mapped[str] = mapped_column(
         Text,
+        nullable=False,
+    )
+
+
+class QuizQuestion(Base):
+    __tablename__ = "quiz_questions"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+    quiz_id: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+    )
+    question_no: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    question_text: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    options_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    correct_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    explanation: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    source: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+
+class QuizRun(Base):
+    __tablename__ = "quiz_runs"
+
+    id: Mapped[str] = mapped_column(
+        String(60),
+        primary_key=True,
+    )
+    quiz_id: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+    )
+    target_chat_id: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    started_by: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    mode: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+    interval_seconds: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    current_question: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
         nullable=False,
     )
 
@@ -806,18 +892,49 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
+    """Start a new quiz workflow or open a prepared quiz by deep link."""
 
     context.user_data.clear()
 
-    if not is_admin(
-        update.effective_user.id
-    ):
+    if not is_admin(update.effective_user.id):
         await update.effective_message.reply_text(
             "ðŸ“š ECA Quiz Maker\n\n"
-            "Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins "
-            "à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
+            "Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
         )
         return ConversationHandler.END
+
+    args = context.args or []
+    if args and args[0].startswith("quiz_"):
+        quiz_id = args[0][5:]
+        with SessionLocal() as session:
+            quiz = session.get(Quiz, quiz_id)
+
+        if not quiz:
+            await update.effective_message.reply_text(
+                "âŒ à¤¯à¤¹ quiz link valid à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆ à¤¯à¤¾ quiz à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤"
+            )
+            return ConversationHandler.END
+
+        context.user_data["prepared_quiz_id"] = quiz_id
+        context.user_data["topic"] = quiz.title
+        context.user_data["question_count"] = quiz.question_count
+        context.user_data["language"] = quiz.language
+
+        await update.effective_message.reply_text(
+            "ðŸŽ¯ QUIZ READY\n\n"
+            f"Topic: {quiz.title}\n"
+            f"Questions: {quiz.question_count}\n\n"
+            "Quiz à¤•à¤¹à¤¾à¤ à¤¶à¥à¤°à¥‚ à¤•à¤°à¤¨à¤¾ à¤¹à¥ˆ?"
+        )
+        await update.effective_message.reply_text(
+            "ðŸ‘‡ Start location à¤šà¥à¤¨à¥‡à¤‚:",
+            reply_markup=ReplyKeyboardMarkup(
+                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+        return 7
 
     keyboard = [
         ["ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡"],
@@ -827,7 +944,7 @@ async def start(
     await update.effective_message.reply_text(
         "ðŸ“š ETERNAL CIVIL ACADEMY\n"
         "QUIZ MAKER\n\n"
-        "Mode à¤šà¥à¤¨à¥‡à¤‚:",
+        "à¤†à¤ª à¤•à¥à¤¯à¤¾ à¤•à¤°à¤¨à¤¾ à¤šà¤¾à¤¹à¤¤à¥‡ à¤¹à¥ˆà¤‚?",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
             resize_keyboard=True,
@@ -1685,9 +1802,12 @@ async def generate_questions(
 ) -> list[dict[str, Any]]:
 
     generated: list[dict[str, Any]] = []
+    attempts = 0
+    max_attempts = max(3, count * 2)
 
-    while len(generated) < count:
+    while len(generated) < count and attempts < max_attempts:
 
+        attempts += 1
         remaining = count - len(generated)
 
         batch_count = min(
@@ -1797,28 +1917,25 @@ async def publish_quiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """Generate questions, save them, and wait for the user to choose
+    where/how the quiz should actually start. Questions are NOT published
+    all at once.
+    """
 
     topic = context.user_data["topic"]
     count = context.user_data["question_count"]
     language = context.user_data["language"]
     mode = context.user_data["mode"]
 
-    source_text = context.user_data.get(
-        "source_text",
-        "",
-    )
-
-    source_file = context.user_data.get(
-        "source_file",
-    )
+    source_text = context.user_data.get("source_text", "")
+    source_file = context.user_data.get("source_file")
 
     await update.effective_message.reply_text(
         "â³ Questions generate à¤•à¤¿à¤ à¤œà¤¾ à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚...\n"
-        "Authenticity, originality à¤”à¤° duplicate checks à¤šà¤² à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚à¥¤"
+        "Originality, source verification à¤”à¤° duplicate checks à¤šà¤² à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚à¥¤"
     )
 
     try:
-
         questions = await generate_questions(
             topic=topic,
             count=count,
@@ -1829,12 +1946,10 @@ async def publish_quiz(
         )
 
         if not questions:
-
             await update.effective_message.reply_text(
                 "âŒ à¤‡à¤¸ request à¤ªà¤° à¤•à¥‹à¤ˆ valid question à¤¤à¥ˆà¤¯à¤¾à¤° à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\n"
-                "Source/topic à¤•à¥‹ à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• specific à¤•à¤°à¤•à¥‡ à¤«à¤¿à¤° à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤"
+                "Topic/source à¤•à¥‹ à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• specific à¤•à¤°à¤•à¥‡ à¤«à¤¿à¤° à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤"
             )
-
             return
 
         quiz_id = (
@@ -1842,15 +1957,11 @@ async def publish_quiz(
             f"{update.effective_user.id}"
         )
 
-        closes_at = (
-            datetime.now(timezone.utc)
-            + timedelta(
-                minutes=QUIZ_DURATION_MINUTES
-            )
+        closes_at = datetime.now(timezone.utc) + timedelta(
+            minutes=max(5, len(questions) * 5)
         )
 
         with SessionLocal() as session:
-
             session.add(
                 Quiz(
                     id=quiz_id,
@@ -1859,110 +1970,347 @@ async def publish_quiz(
                     title=topic,
                     question_count=len(questions),
                     language=language,
-                    created_at=datetime.now(
-                        timezone.utc
-                    ),
+                    created_at=datetime.now(timezone.utc),
                     closes_at=closes_at,
                     leaderboard_sent=False,
                 )
             )
 
+            for index, item in enumerate(questions, start=1):
+                session.add(
+                    QuizQuestion(
+                        quiz_id=quiz_id,
+                        question_no=index,
+                        question_text=item["question"],
+                        options_json=json.dumps(
+                            item["options"],
+                            ensure_ascii=False,
+                        ),
+                        correct_index=item["correct_index"],
+                        explanation=item["explanation"],
+                        source=item["source"],
+                    )
+                )
+
             session.commit()
 
-        await update.effective_message.reply_text(
-            "âœ… Questions à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆà¤‚à¥¤\n\n"
-            f"Total valid questions: {len(questions)}\n"
-            f"Quiz duration: {QUIZ_DURATION_MINUTES} minutes\n\n"
-            "Telegram Quiz publish à¤¹à¥‹ à¤°à¤¹à¤¾ à¤¹à¥ˆ..."
+        context.user_data["prepared_quiz_id"] = quiz_id
+
+        me = await context.bot.get_me()
+        personal_link = (
+            f"https://t.me/{me.username}?start=quiz_{quiz_id}"
         )
 
-        for index, item in enumerate(
-            questions,
-            start=1,
-        ):
+        await update.effective_message.reply_text(
+            "âœ… QUIZ READY\n\n"
+            f"ðŸ“š Topic: {topic}\n"
+            f"ðŸ”¢ Questions: {len(questions)}\n"
+            f"ðŸŒ Language: {language}\n\n"
+            "à¤…à¤­à¥€ questions Telegram à¤ªà¤° à¤à¤• à¤¸à¤¾à¤¥ à¤¨à¤¹à¥€à¤‚ à¤­à¥‡à¤œà¥‡ à¤—à¤ à¤¹à¥ˆà¤‚à¥¤\n"
+            "à¤ªà¤¹à¤²à¥‡ Start Location à¤”à¤° à¤«à¤¿à¤° à¤ªà¥à¤°à¤¤à¤¿-question time à¤šà¥à¤¨à¤¨à¤¾ à¤¹à¥‹à¤—à¤¾à¥¤\n\n"
+            f"ðŸ”— Quiz link:\n{personal_link}"
+        )
 
-            description = (
-                f"ðŸ“š ECA\n"
-                f"Topic: {topic}\n\n"
-                f"{SOURCE_FOOTER}"
+        await update.effective_message.reply_text(
+            "ðŸ“ Quiz à¤•à¤¹à¤¾à¤ à¤¶à¥à¤°à¥‚ à¤•à¤°à¤¨à¤¾ à¤¹à¥ˆ?",
+            reply_markup=ReplyKeyboardMarkup(
+                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+
+    except Exception:
+        logger.exception("Quiz preparation failed.")
+        await update.effective_message.reply_text(
+            "âŒ Quiz preparation à¤®à¥‡à¤‚ error à¤†à¤¯à¤¾à¥¤\n"
+            "Render logs à¤®à¥‡à¤‚ à¤ªà¥‚à¤°à¤¾ technical error à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
+        )
+    finally:
+        cleanup_file(source_file)
+
+
+async def choose_start_location(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    choice = update.effective_message.text.strip()
+    quiz_id = context.user_data.get("prepared_quiz_id")
+
+    if not quiz_id:
+        await update.effective_message.reply_text(
+            "âŒ à¤•à¥‹à¤ˆ prepared quiz à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤"
+        )
+        return ConversationHandler.END
+
+    if choice == "ðŸ‘¤ Personally":
+        if update.effective_chat.type != "private":
+            await update.effective_message.reply_text(
+                "âŒ Personal mode à¤•à¥‡ à¤²à¤¿à¤ bot à¤•à¥€ private chat à¤®à¥‡à¤‚ quiz start à¤•à¤°à¥‡à¤‚à¥¤\n"
+                "à¤‡à¤¸ chat à¤®à¥‡à¤‚ Group mode à¤šà¥à¤¨à¥‡à¤‚à¥¤"
+            )
+            return 7
+
+        context.user_data["run_mode"] = "personal"
+        context.user_data["target_chat_id"] = update.effective_chat.id
+
+    elif choice == "ðŸ‘¥ Group":
+        if update.effective_chat.type in ("group", "supergroup"):
+            context.user_data["run_mode"] = "group"
+            context.user_data["target_chat_id"] = update.effective_chat.id
+        else:
+            context.user_data["run_mode"] = "group"
+            context.user_data["target_chat_id"] = None
+
+            me = await context.bot.get_me()
+            group_link = (
+                f"https://t.me/{me.username}?startgroup=quiz_{quiz_id}"
+            )
+
+            await update.effective_message.reply_text(
+                "ðŸ‘¥ Group mode selected.\n\n"
+                "à¤œà¤¿à¤¸ Telegram group à¤®à¥‡à¤‚ quiz à¤šà¤²à¤¾à¤¨à¤¾ à¤¹à¥ˆ, à¤‰à¤¸à¤®à¥‡à¤‚ bot à¤•à¥‹ add à¤•à¤°à¥‡à¤‚ "
+                "à¤”à¤° à¤µà¤¹à¥€à¤‚ à¤‡à¤¸ quiz à¤•à¥‹ start à¤•à¤°à¥‡à¤‚à¥¤\n\n"
+                f"ðŸ”— Group start link:\n{group_link}\n\n"
+                "à¤¯à¤¾ group à¤®à¥‡à¤‚ bot à¤•à¥‹ add à¤•à¤°à¤•à¥‡ à¤­à¥‡à¤œà¥‡à¤‚:\n"
+                f"/start quiz_{quiz_id}"
+            )
+
+            return 7
+    else:
+        await update.effective_message.reply_text(
+            "à¤•à¥ƒà¤ªà¤¯à¤¾ Personally à¤¯à¤¾ Group à¤šà¥à¤¨à¥‡à¤‚à¥¤"
+        )
+        return 7
+
+    await update.effective_message.reply_text(
+        "â±ï¸ à¤à¤• question à¤•à¤¿à¤¤à¤¨à¥‡ à¤¸à¤®à¤¯ à¤¤à¤• à¤šà¤²à¥‡?\n\n"
+        "à¤¸à¤®à¤¯ à¤¹à¤° question à¤ªà¤° à¤²à¤¾à¤—à¥‚ à¤¹à¥‹à¤—à¤¾ à¤”à¤° à¤¸à¤®à¤¯ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¤à¥‡ à¤¹à¥€ à¤…à¤—à¤²à¤¾ question "
+        "à¤…à¤ªà¤¨à¥‡-à¤†à¤ª à¤†à¤à¤—à¤¾à¥¤",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["15 à¤¸à¥‡à¤•à¤‚à¤¡", "25 à¤¸à¥‡à¤•à¤‚à¤¡"],
+                ["30 à¤¸à¥‡à¤•à¤‚à¤¡", "1 à¤®à¤¿à¤¨à¤Ÿ"],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+    return 8
+
+
+async def choose_question_time(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    mapping = {
+        "15 à¤¸à¥‡à¤•à¤‚à¤¡": 15,
+        "25 à¤¸à¥‡à¤•à¤‚à¤¡": 25,
+        "30 à¤¸à¥‡à¤•à¤‚à¤¡": 30,
+        "1 à¤®à¤¿à¤¨à¤Ÿ": 60,
+    }
+
+    choice = update.effective_message.text.strip()
+    seconds = mapping.get(choice)
+
+    if not seconds:
+        await update.effective_message.reply_text(
+            "à¤•à¥ƒà¤ªà¤¯à¤¾ 15, 25, 30 à¤¸à¥‡à¤•à¤‚à¤¡ à¤¯à¤¾ 1 à¤®à¤¿à¤¨à¤Ÿ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤"
+        )
+        return 8
+
+    quiz_id = context.user_data.get("prepared_quiz_id")
+    mode = context.user_data.get("run_mode")
+    target_chat_id = context.user_data.get("target_chat_id")
+
+    if not quiz_id:
+        await update.effective_message.reply_text(
+            "âŒ Quiz session à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤"
+        )
+        return ConversationHandler.END
+
+    if mode == "group" and not target_chat_id:
+        await update.effective_message.reply_text(
+            "âŒ Group chat select à¤¨à¤¹à¥€à¤‚ à¤¹à¥à¤†à¥¤ à¤Šà¤ªà¤° à¤¦à¤¿à¤ Group start link à¤¸à¥‡ "
+            "group à¤®à¥‡à¤‚ quiz à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤"
+        )
+        return ConversationHandler.END
+
+    if mode == "personal":
+        target_chat_id = update.effective_chat.id
+
+    run_id = f"{quiz_id}-run-{int(datetime.now().timestamp())}-{update.effective_user.id}"
+
+    with SessionLocal() as session:
+        session.add(
+            QuizRun(
+                id=run_id,
+                quiz_id=quiz_id,
+                target_chat_id=target_chat_id,
+                started_by=update.effective_user.id,
+                mode=mode,
+                interval_seconds=seconds,
+                current_question=0,
+                active=True,
+            )
+        )
+        session.commit()
+
+    context.user_data.clear()
+
+    await update.effective_message.reply_text(
+        "ðŸš€ QUIZ STARTING\n\n"
+        f"â±ï¸ à¤ªà¥à¤°à¤¤à¥à¤¯à¥‡à¤• question: {seconds} seconds\n"
+        "âž¡ï¸ à¤¸à¤®à¤¯ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¤à¥‡ à¤¹à¥€ à¤…à¤—à¤²à¤¾ question à¤…à¤ªà¤¨à¥‡-à¤†à¤ª à¤†à¤à¤—à¤¾à¥¤\n"
+        "âŒ à¤¸à¤­à¥€ questions à¤à¤• à¤¸à¤¾à¤¥ à¤¨à¤¹à¥€à¤‚ à¤­à¥‡à¤œà¥‡ à¤œà¤¾à¤à¤‚à¤—à¥‡à¥¤",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    await send_next_question(context, run_id)
+
+    return ConversationHandler.END
+
+
+async def send_next_question(
+    context: ContextTypes.DEFAULT_TYPE,
+    run_id: str,
+) -> None:
+    """Send exactly one question, then schedule the next one."""
+
+    with SessionLocal() as session:
+        run = session.get(QuizRun, run_id)
+        if not run or not run.active:
+            return
+
+        quiz = session.get(Quiz, run.quiz_id)
+        if not quiz:
+            run.active = False
+            session.commit()
+            return
+
+        question_no = run.current_question + 1
+
+        question = session.scalar(
+            select(QuizQuestion)
+            .where(
+                QuizQuestion.quiz_id == run.quiz_id,
+                QuizQuestion.question_no == question_no,
+            )
+        )
+
+        if not question:
+            run.active = False
+            session.commit()
+            quiz.leaderboard_sent = False
+            session.commit()
+
+            text = await asyncio.to_thread(
+                build_leaderboard,
+                run.quiz_id,
             )
 
             try:
-
-                message = await context.bot.send_poll(
-                    chat_id=update.effective_chat.id,
-                    question=item["question"][:300],
-                    options=[
-                        x[:100]
-                        for x in item["options"]
-                    ],
-                    type="quiz",
-                    is_anonymous=False,
-                    allows_multiple_answers=False,
-                    correct_option_id=item["correct_index"],
-                    explanation=item["explanation"][:200],
-                    description=description[:1024],
-                    open_period=(
-                        QUIZ_DURATION_MINUTES * 60
+                await context.bot.send_message(
+                    chat_id=run.target_chat_id,
+                    text=(
+                        "ðŸ QUIZ COMPLETED\n\n"
+                        "à¤¸à¤­à¥€ questions à¤ªà¥‚à¤°à¥‡ à¤¹à¥‹ à¤—à¤à¥¤\n\n"
+                        + text[:3500]
                     ),
                 )
-
-                if not message.poll:
-                    raise RuntimeError(
-                        "Telegram did not return a Poll object."
-                    )
-
-                with SessionLocal() as session:
-                    session.add(
-                        QuizPoll(
-                            quiz_id=quiz_id,
-                            poll_id=message.poll.id,
-                            question_no=index,
-                            correct_index=item["correct_index"],
-                            question_text=item["question"],
-                        )
-                    )
-                    session.commit()
-
-                save_history(
-                    item,
-                    item["source"],
-                )
-
             except Exception:
-                logger.exception(
-                    "Could not publish question %s",
-                    index,
-                )
+                logger.exception("Could not send completion message.")
+            return
 
-                await update.effective_message.reply_text(
-                    f"âš ï¸ Question {index} publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤"
-                )
+        options = json.loads(question.options_json)
 
-        await update.effective_message.reply_text(
-            "ðŸŽ¯ Quiz publish complete.\n\n"
-            f"Quiz ID: {quiz_id}\n"
-            f"Valid questions: {len(questions)}\n\n"
-            f"Quiz {QUIZ_DURATION_MINUTES} minutes à¤¬à¤¾à¤¦ close à¤¹à¥‹à¤—à¤¾à¥¤"
-        )
-
-        # Schedule final leaderboard.
-        if context.job_queue:
-            context.job_queue.run_once(
-                send_leaderboard_job,
-                when=QUIZ_DURATION_MINUTES * 60 + 10,
-                data={
-                    "quiz_id": quiz_id,
-                    "chat_id": update.effective_chat.id,
-                },
-                name=f"leaderboard-{quiz_id}",
+        try:
+            message = await context.bot.send_poll(
+                chat_id=run.target_chat_id,
+                question=question.question_text[:300],
+                options=[x[:100] for x in options],
+                type="quiz",
+                is_anonymous=False,
+                allows_multiple_answers=False,
+                correct_option_id=question.correct_index,
+                explanation=question.explanation[:200],
+                description=(
+                    f"ðŸ“š ECA Quiz\n"
+                    f"Question {question_no}\n\n"
+                    f"{SOURCE_FOOTER}"
+                )[:1024],
+                open_period=run.interval_seconds,
             )
 
-    finally:
+            if not message.poll:
+                raise RuntimeError("Telegram did not return a Poll object.")
 
-        cleanup_file(
-            source_file
-        )
+            session.add(
+                QuizPoll(
+                    quiz_id=run.quiz_id,
+                    poll_id=message.poll.id,
+                    question_no=question_no,
+                    correct_index=question.correct_index,
+                    question_text=question.question_text,
+                )
+            )
+            run.current_question = question_no
+            session.commit()
+
+            save_history(
+                {
+                    "question": question.question_text,
+                    "topic": quiz.title,
+                },
+                question.source,
+            )
+
+        except Exception:
+            logger.exception(
+                "Could not publish question %s for run %s",
+                question_no,
+                run_id,
+            )
+
+            run.active = False
+            session.commit()
+
+            await context.bot.send_message(
+                chat_id=run.target_chat_id,
+                text=(
+                    f"âŒ Question {question_no} publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n"
+                    "Quiz à¤°à¥‹à¤• à¤¦à¤¿à¤¯à¤¾ à¤—à¤¯à¤¾ à¤¹à¥ˆà¥¤"
+                ),
+            )
+            return
+
+        # Schedule the next question exactly after the selected interval.
+        if context.job_queue:
+            context.job_queue.run_once(
+                send_next_question_job,
+                when=run.interval_seconds,
+                data={"run_id": run_id},
+                name=f"next-{run_id}-{question_no}",
+            )
+
+
+async def send_next_question_job(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    job = context.job
+    if not job or not job.data:
+        return
+
+    await send_next_question(
+        context,
+        job.data["run_id"],
+    )
 
 
 # ----------------------------
@@ -2365,6 +2713,8 @@ def main() -> None:
     # 4 = source file/poll
     # 5 = count
     # 6 = language
+    # 7 = start location
+    # 8 = per-question time
 
     conversation = ConversationHandler(
         entry_points=[
@@ -2438,6 +2788,22 @@ def main() -> None:
                     filters.TEXT
                     & ~filters.COMMAND,
                     receive_language,
+                )
+            ],
+
+            7: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    choose_start_location,
+                )
+            ],
+
+            8: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    choose_question_time,
                 )
             ],
         },
