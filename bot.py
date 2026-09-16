@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ECA QUIZ MAKER â€” Production Telegram Quiz Bot
+ECA QUIZ MAKER Ã¢â‚¬â€ Production Telegram Quiz Bot
 
 Designed for Render + Telegram + Google Gemini.
 
 Core flow
 ---------
-1) ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡
-2) ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾
+1) Ã°Å¸Â¤â€“ AI Ã Â¤â€“Ã Â¥ÂÃ Â¤Â¦ Questions Generate Ã Â¤â€¢Ã Â¤Â°Ã Â¥â€¡
+2) Ã°Å¸â€œÅ¡ Ã Â¤Â®Ã Â¥Ë†Ã Â¤â€š Ã Â¤â€“Ã Â¥ÂÃ Â¤Â¦ Source Ã Â¤Â¦Ã Â¥â€šÃ Â¤ÂÃ Â¤â€”Ã Â¤Â¾
 
 AI mode: Topic -> Count -> Language -> Gemini searches/grounds sources ->
 original MCQs -> strict validation -> prepared quiz.
@@ -54,6 +54,14 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from google import genai
 from google.genai import types
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine, select
@@ -114,29 +122,29 @@ AI_RETRY_DELAY = 2.0
 SOURCE_FOOTER = "Source: @EternalCivilAcademy"
 
 LANGUAGE_LABELS = {
-    "à¤¹à¤¿à¤‚à¤¦à¥€": "Hindi",
+    "Hindi": "Hindi",
     "English": "English",
-    "à¤¦à¥à¤µà¤¿à¤­à¤¾à¤·à¥€": "Bilingual",
+    "Bilingual": "Bilingual",
 }
-LANGUAGE_BUTTONS = [["à¤¹à¤¿à¤‚à¤¦à¥€", "English"], ["à¤¦à¥à¤µà¤¿à¤­à¤¾à¤·à¥€"]]
+LANGUAGE_BUTTONS = [["Hindi", "English"], ["Bilingual"]]
 
 TIME_OPTIONS = {
-    "15 à¤¸à¥‡à¤•à¤‚à¤¡": 15,
-    "25 à¤¸à¥‡à¤•à¤‚à¤¡": 25,
-    "30 à¤¸à¥‡à¤•à¤‚à¤¡": 30,
-    "1 à¤®à¤¿à¤¨à¤Ÿ": 60,
+    "15 seconds": 15,
+    "25 seconds": 25,
+    "30 seconds": 30,
+    "1 minute": 60,
 }
-TIME_BUTTONS = [["15 à¤¸à¥‡à¤•à¤‚à¤¡", "25 à¤¸à¥‡à¤•à¤‚à¤¡"], ["30 à¤¸à¥‡à¤•à¤‚à¤¡", "1 à¤®à¤¿à¤¨à¤Ÿ"]]
+TIME_BUTTONS = [["15 seconds", "25 seconds"], ["30 seconds", "1 minute"]]
 
 MAIN_BUTTONS = [
-    ["ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡"],
-    ["ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾"],
+    ["Ã°Å¸Â¤â€“ AI Generate Questions"],
+    ["Ã°Å¸â€œÅ¡ I Will Provide Source"],
 ]
 
 SOURCE_TYPE_BUTTONS = [
-    ["ðŸ“„ PDF", "ðŸ–¼ Photo"],
-    ["ðŸ“ Text", "ðŸ“Š Telegram Poll"],
-    ["ðŸ”— URL"],
+    ["Ã°Å¸â€œâ€ž PDF", "Ã°Å¸â€“Â¼ Photo"],
+    ["Ã°Å¸â€œÂ Text", "Ã°Å¸â€œÅ  Telegram Poll"],
+    ["Ã°Å¸â€â€” URL"],
 ]
 
 
@@ -372,12 +380,32 @@ def set_ai_cooldown(seconds: int = 45) -> None:
 # Text helpers / duplicate detection
 # ============================================================
 
+MOJIBAKE_MARKERS = ("ÃƒÂ Ã‚Â¤", "ÃƒÂ Ã‚Â¥", "ÃƒÂ°Ã…Â¸", "ÃƒÂ¢", "ÃƒÆ’", "Ãƒâ€š")
+
+def repair_mojibake(value: Any) -> str:
+    """Repair common UTF-8-as-Latin-1 mojibake without touching valid Hindi/English.
+
+    This is a defensive guard for copied/stored text. Normal Unicode text is returned unchanged.
+    """
+    text = str(value or "")
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
+        return text
+    for encoding in ("latin1", "cp1252"):
+        try:
+            candidate = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if candidate and not any(marker in candidate for marker in MOJIBAKE_MARKERS):
+            return candidate
+    return text
+
+
 PUNCT_RE = re.compile(r"[^\w\s\u0900-\u097F]", flags=re.UNICODE)
 SPACE_RE = re.compile(r"\s+")
 
 
 def normalize(text: str) -> str:
-    text = str(text or "").strip().lower()
+    text = repair_mojibake(text).strip().lower()
     text = PUNCT_RE.sub(" ", text)
     return SPACE_RE.sub(" ", text).strip()
 
@@ -442,7 +470,7 @@ def recent_history(limit: int = MAX_HISTORY_FOR_PROMPT) -> list[str]:
 
 
 def save_history(question: dict[str, Any]) -> None:
-    text = str(question.get("question", "")).strip()
+    text = repair_mojibake(question.get("question", "")).strip()
     if not text:
         return
     q_hash = hash_question(text)
@@ -484,15 +512,15 @@ def is_admin(user_id: int) -> bool:
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "â€”"
+    username = f"@{user.username}" if user and user.username else "Ã¢â‚¬â€"
     await update.effective_message.reply_text(
-        f"ðŸ†” Telegram User ID\n{user.id}\n\nUsername: {username}"
+        f"Ã°Å¸â€ â€ Telegram User ID\n{user.id}\n\nUsername: {username}"
     )
 
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² Owner Admin à¤œà¥‹à¤¡à¤¼ à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Only the Owner can add admins.")
         return
 
     target_id: Optional[int] = None
@@ -510,30 +538,30 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not target_id:
         await update.effective_message.reply_text(
-            "à¤•à¤¿à¤¸à¥€ user à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡ /addadmin à¤­à¥‡à¤œà¥‡à¤‚à¥¤\n\n"
-            "à¤¯à¤¾ /addadmin USER_ID"
+            "Ã Â¤â€¢Ã Â¤Â¿Ã Â¤Â¸Ã Â¥â‚¬ user Ã Â¤â€¢Ã Â¥â€¡ message Ã Â¤ÂªÃ Â¤Â° reply Ã Â¤â€¢Ã Â¤Â°Ã Â¤â€¢Ã Â¥â€¡ /addadmin Ã Â¤Â­Ã Â¥â€¡Ã Â¤Å“Ã Â¥â€¡Ã Â¤â€šÃ Â¥Â¤\n\n"
+            "Ã Â¤Â¯Ã Â¤Â¾ /addadmin USER_ID"
         )
         return
 
     if target_id == OWNER_USER_ID:
-        await update.effective_message.reply_text("â„¹ï¸ à¤¯à¤¹ user à¤ªà¤¹à¤²à¥‡ à¤¸à¥‡ Owner à¤¹à¥ˆà¥¤")
+        await update.effective_message.reply_text("Ã¢â€žÂ¹Ã¯Â¸Â This user is already the Owner.")
         return
 
     with SessionLocal() as session:
         if session.get(Admin, target_id):
-            await update.effective_message.reply_text(f"â„¹ï¸ à¤¯à¤¹ user à¤ªà¤¹à¤²à¥‡ à¤¸à¥‡ Admin à¤¹à¥ˆà¥¤\nID: {target_id}")
+            await update.effective_message.reply_text(f"Ã¢â€žÂ¹Ã¯Â¸Â This user is already an Admin.\nID: {target_id}")
             return
         session.add(Admin(user_id=target_id, added_by=OWNER_USER_ID))
         session.commit()
 
     await update.effective_message.reply_text(
-        f"âœ… Admin authorized\n\nName: {target_name}\nUser ID: {target_id}"
+        f"Ã¢Å“â€¦ Admin authorized\n\nName: {target_name}\nUser ID: {target_id}"
     )
 
 
 async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² Owner Admin remove à¤•à¤° à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Only the Owner can remove admins.")
         return
 
     target_id: Optional[int] = None
@@ -547,34 +575,34 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             target_id = None
 
     if not target_id:
-        await update.effective_message.reply_text("Admin à¤•à¥‡ message à¤ªà¤° reply à¤•à¤°à¤•à¥‡ /removeadmin à¤­à¥‡à¤œà¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Reply to the admin message with /removeadmin.")
         return
     if target_id == OWNER_USER_ID:
-        await update.effective_message.reply_text("âŒ Owner à¤•à¥‹ remove à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤œà¤¾ à¤¸à¤•à¤¤à¤¾à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ The Owner cannot be removed.")
         return
 
     with SessionLocal() as session:
         admin = session.get(Admin, target_id)
         if not admin:
-            await update.effective_message.reply_text("â„¹ï¸ à¤¯à¤¹ user Admin à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+            await update.effective_message.reply_text("Ã¢â€žÂ¹Ã¯Â¸Â This user is not an Admin.")
             return
         session.delete(admin)
         session.commit()
 
-    await update.effective_message.reply_text(f"âœ… Admin access removed\nUser ID: {target_id}")
+    await update.effective_message.reply_text(f"Ã¢Å“â€¦ Admin access removed\nUser ID: {target_id}")
 
 
 async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² Owner Admin list à¤¦à¥‡à¤– à¤¸à¤•à¤¤à¤¾ à¤¹à¥ˆà¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Only the Owner can view the admin list.")
         return
 
     with SessionLocal() as session:
         rows = session.scalars(select(Admin).order_by(Admin.added_at)).all()
 
-    lines = ["ðŸ‘‘ ECA QUIZ MAKER ADMINS", "", f"Owner: {OWNER_USER_ID}", "", "Authorized Admins:"]
+    lines = ["Ã°Å¸â€˜â€˜ ECA QUIZ MAKER ADMINS", "", f"Owner: {OWNER_USER_ID}", "", "Authorized Admins:"]
     if not rows:
-        lines.append("à¤•à¥‹à¤ˆ additional Admin à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+        lines.append("No additional Admins.")
     else:
         lines.extend(f"{i}. {row.user_id}" for i, row in enumerate(rows, 1))
     await update.effective_message.reply_text("\n".join(lines))
@@ -640,6 +668,368 @@ def cleanup_file(path: Optional[str]) -> None:
         Path(path).unlink(missing_ok=True)
     except Exception:
         logger.warning("Could not clean temporary file: %s", path)
+
+
+
+# ============================================================
+# PDF answer & explanation booklet
+# ============================================================
+
+TELEGRAM_URL = "https://t.me/EternalCivilAcademy"
+
+
+def find_unicode_pdf_font() -> tuple[str, Optional[str]]:
+    """Find a Unicode TTF available in the hosting environment.
+
+    DejaVu Sans is commonly present on Debian/Ubuntu-based Render images and
+    covers the Latin + Devanagari text needed by the ECA booklet. We also check
+    a few other common system locations before falling back to Helvetica.
+    """
+    candidates = [
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.ttf",
+        ),
+    ]
+    for regular, bold in candidates:
+        if os.path.exists(regular):
+            return regular, bold if os.path.exists(bold) else None
+    return "", None
+
+
+PDF_FONT_NAME = "Helvetica"
+PDF_FONT_BOLD = "Helvetica-Bold"
+_pdf_regular, _pdf_bold = find_unicode_pdf_font()
+
+if _pdf_regular:
+    try:
+        pdfmetrics.registerFont(TTFont("ECAUnicode", _pdf_regular))
+        PDF_FONT_NAME = "ECAUnicode"
+        if _pdf_bold:
+            pdfmetrics.registerFont(TTFont("ECAUnicodeBold", _pdf_bold))
+            PDF_FONT_BOLD = "ECAUnicodeBold"
+        else:
+            PDF_FONT_BOLD = PDF_FONT_NAME
+    except Exception:
+        logger.exception("Could not register Unicode PDF font; using Helvetica.")
+
+
+def escape_pdf_text(value: Any) -> str:
+    """Normalize/repair text before placing it in a ReportLab Paragraph."""
+    text = repair_mojibake(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br/>")
+    )
+
+
+def get_quiz_test_number(quiz_id: str) -> int:
+    """Return a stable sequential test number based on quiz creation order."""
+    with SessionLocal() as session:
+        quizzes = session.scalars(
+            select(Quiz.id).order_by(Quiz.created_at, Quiz.id)
+        ).all()
+    try:
+        return quizzes.index(quiz_id) + 1
+    except ValueError:
+        return len(quizzes) + 1
+
+
+def format_quiz_datetime(value: Optional[datetime]) -> str:
+    if not value:
+        return "Not available"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local_time = value.astimezone(timezone(timedelta(hours=5, minutes=30)))
+    return local_time.strftime("%d %B %Y, %I:%M %p")
+
+
+def format_time_per_question(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds == 60:
+        return "1 Minute"
+    return f"{seconds} Seconds"
+
+
+def _pdf_header_footer(canvas, doc) -> None:
+    canvas.saveState()
+    width, height = A4
+
+    canvas.setFont(PDF_FONT_BOLD, 9)
+    canvas.drawCentredString(
+        width / 2,
+        height - 12 * mm,
+        "Eternal Civil Academy"
+    )
+    canvas.setFont(PDF_FONT_NAME, 7.5)
+    canvas.drawCentredString(
+        width / 2,
+        9 * mm,
+        f"Telegram: {TELEGRAM_URL}"
+    )
+    canvas.setFont(PDF_FONT_NAME, 7)
+    canvas.drawRightString(
+        width - 15 * mm,
+        9 * mm,
+        f"Page {doc.page}"
+    )
+    canvas.restoreState()
+
+
+def build_answer_explanation_pdf(run_id: str, output_path: str) -> str:
+    """Create the requested ECA answer + explanation booklet.
+
+    The PDF contains:
+      - Test number
+      - Quiz title/topic
+      - Total questions
+      - Actual quiz start date/time
+      - Time per question
+      - Quiz language
+      - ECA branding + Telegram link
+      - Every question
+      - Correct answer
+      - Explanation
+
+    It intentionally does NOT contain student-wise marks, rank, or attempts.
+    """
+    with SessionLocal() as session:
+        run = session.get(QuizRun, run_id)
+        if not run:
+            raise RuntimeError("Quiz run not found.")
+
+        quiz = session.get(Quiz, run.quiz_id)
+        if not quiz:
+            raise RuntimeError("Quiz not found.")
+
+        questions = session.scalars(
+            select(QuizQuestion)
+            .where(QuizQuestion.quiz_id == quiz.id)
+            .order_by(QuizQuestion.question_no)
+        ).all()
+
+        if not questions:
+            raise RuntimeError("No quiz questions found.")
+
+        test_number = get_quiz_test_number(quiz.id)
+        topic = repair_mojibake(quiz.title)
+        language = repair_mojibake(quiz.language)
+
+        # Preserve the actual quiz start time and configured per-question time.
+        started_at = run.started_at
+        interval_seconds = int(run.interval_seconds)
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = SimpleDocTemplate(
+        str(output),
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=22 * mm,
+        bottomMargin=16 * mm,
+        title=f"Eternal Civil Academy - Test No. {test_number:02d}",
+        author="Eternal Civil Academy",
+        subject="Quiz Answer and Explanation Booklet",
+    )
+
+    styles = getSampleStyleSheet()
+
+    brand = ParagraphStyle(
+        "ECABrand",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_BOLD,
+        fontSize=16,
+        leading=20,
+        alignment=TA_CENTER,
+        spaceAfter=2 * mm,
+    )
+    tagline = ParagraphStyle(
+        "ECATagline",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_NAME,
+        fontSize=9.5,
+        leading=12,
+        alignment=TA_CENTER,
+        spaceAfter=5 * mm,
+    )
+    title_style = ParagraphStyle(
+        "QuizTitle",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_BOLD,
+        fontSize=14,
+        leading=18,
+        alignment=TA_CENTER,
+        spaceAfter=5 * mm,
+    )
+    meta = ParagraphStyle(
+        "Meta",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_NAME,
+        fontSize=9.2,
+        leading=14,
+        spaceAfter=1.2 * mm,
+    )
+    q_style = ParagraphStyle(
+        "Question",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_BOLD,
+        fontSize=10.5,
+        leading=15,
+        spaceBefore=3 * mm,
+        spaceAfter=2 * mm,
+    )
+    answer_style = ParagraphStyle(
+        "Answer",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_BOLD,
+        fontSize=9.8,
+        leading=14,
+        spaceAfter=2 * mm,
+    )
+    expl_style = ParagraphStyle(
+        "Explanation",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_NAME,
+        fontSize=9.5,
+        leading=14,
+        spaceAfter=2 * mm,
+    )
+    option_style = ParagraphStyle(
+        "Option",
+        parent=styles["Normal"],
+        fontName=PDF_FONT_NAME,
+        fontSize=9.4,
+        leading=13,
+        leftIndent=5 * mm,
+    )
+
+    story = [
+        Paragraph("ETERNAL CIVIL ACADEMY", brand),
+        Paragraph("Your Success, Our Commitment", tagline),
+        Paragraph(f"TEST NO. {test_number:02d}", title_style),
+        Paragraph(
+            f"<b>QUIZ TITLE:</b> {escape_pdf_text(topic)}",
+            meta,
+        ),
+        Paragraph(
+            f"<b>TOTAL QUESTIONS:</b> {len(questions)}",
+            meta,
+        ),
+        Paragraph(
+            f"<b>QUIZ DATE &amp; TIME:</b> {escape_pdf_text(format_quiz_datetime(started_at))}",
+            meta,
+        ),
+        Paragraph(
+            f"<b>TIME PER QUESTION:</b> {escape_pdf_text(format_time_per_question(interval_seconds))}",
+            meta,
+        ),
+        Paragraph(
+            f"<b>LANGUAGE:</b> {escape_pdf_text(language)}",
+            meta,
+        ),
+        Paragraph(
+            f"<b>TELEGRAM:</b> {escape_pdf_text(TELEGRAM_URL)}",
+            meta,
+        ),
+        Spacer(1, 4 * mm),
+    ]
+
+    for question in questions:
+        question_text = repair_mojibake(question.question_text)
+        options = json.loads(question.options_json)
+        correct_index = int(question.correct_index)
+        explanation = repair_mojibake(question.explanation)
+
+        story.append(
+            Paragraph(
+                f"<b>Question {question.question_no}.</b> {escape_pdf_text(question_text)}",
+                q_style,
+            )
+        )
+
+        for idx, option in enumerate(options):
+            label = chr(65 + idx)
+            story.append(
+                Paragraph(
+                    f"{label}. {escape_pdf_text(option)}",
+                    option_style,
+                )
+            )
+
+        correct_text = ""
+        if 0 <= correct_index < len(options):
+            correct_text = f"{chr(65 + correct_index)}. {repair_mojibake(options[correct_index])}"
+        else:
+            correct_text = "Not available"
+
+        story.append(
+            Spacer(1, 1.5 * mm)
+        )
+        story.append(
+            Paragraph(
+                f"<b>Correct Answer:</b> {escape_pdf_text(correct_text)}",
+                answer_style,
+            )
+        )
+        story.append(
+            Paragraph(
+                f"<b>Explanation:</b> {escape_pdf_text(explanation)}",
+                expl_style,
+            )
+        )
+
+    doc.build(story, onFirstPage=_pdf_header_footer, onLaterPages=_pdf_header_footer)
+    return str(output)
+
+
+async def send_answer_explanation_pdf(
+    context: ContextTypes.DEFAULT_TYPE,
+    run_id: str,
+    chat_id: int,
+) -> None:
+    """Build and send the completed quiz answer/explanation PDF."""
+    pdf_path = Path(tempfile.gettempdir()) / f"eca_test_{run_id.replace('/', '_')}.pdf"
+    try:
+        await asyncio.to_thread(
+            build_answer_explanation_pdf,
+            run_id,
+            str(pdf_path),
+        )
+        with pdf_path.open("rb") as fh:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=fh,
+                filename=pdf_path.name,
+                caption="Eternal Civil Academy â€” Answer & Explanation Booklet",
+            )
+    except Exception:
+        logger.exception("Could not generate/send answer explanation PDF for run=%s", run_id)
+        await safe_send_message(
+            context.bot,
+            chat_id,
+            "The quiz is complete, but the Answer & Explanation PDF could not be generated.",
+        )
+    finally:
+        try:
+            pdf_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -753,10 +1143,10 @@ REQUESTED LANGUAGE:
 
 {research_block}
 
-PREVIOUS ECA QUESTIONS â€” DO NOT REPEAT OR CLOSELY PARAPHRASE:
+PREVIOUS ECA QUESTIONS Ã¢â‚¬â€ DO NOT REPEAT OR CLOSELY PARAPHRASE:
 {history_block}
 
-QUESTIONS ALREADY CREATED IN THIS REQUEST â€” DO NOT REPEAT:
+QUESTIONS ALREADY CREATED IN THIS REQUEST Ã¢â‚¬â€ DO NOT REPEAT:
 {current_block}
 
 DIVERSITY:
@@ -906,12 +1296,12 @@ async def call_ai(
 
 def valid_question(item: dict[str, Any]) -> bool:
     try:
-        question = str(item.get("question", "")).strip()
-        options = [str(x).strip() for x in item.get("options", [])]
+        question = repair_mojibake(item.get("question", "")).strip()
+        options = [repair_mojibake(x).strip() for x in item.get("options", [])]
         correct_index = int(item.get("correct_index"))
-        explanation = str(item.get("explanation", "")).strip()
-        source = str(item.get("source", "")).strip()
-        topic = str(item.get("topic", "")).strip()
+        explanation = repair_mojibake(item.get("explanation", "")).strip()
+        source = repair_mojibake(item.get("source", "")).strip()
+        topic = repair_mojibake(item.get("topic", "")).strip()
 
         if not question or len(question) > 300:
             return False
@@ -927,6 +1317,11 @@ def valid_question(item: dict[str, Any]) -> bool:
             return False
         if not source or not topic:
             return False
+        item["question"] = question
+        item["options"] = options
+        item["explanation"] = explanation
+        item["source"] = source
+        item["topic"] = topic
         return True
     except Exception:
         return False
@@ -947,7 +1342,7 @@ def post_validate(
     for item in candidates:
         if not isinstance(item, dict) or not valid_question(item):
             continue
-        question = str(item["question"]).strip()
+        question = repair_mojibake(item["question"]).strip()
 
         if exact_duplicate_exists(question) or similar_previous_question(question):
             continue
@@ -1012,7 +1407,7 @@ async def generate_questions(
             calls += 1
 
             if progress_callback:
-                await progress_callback(f"â³ AI question batch {calls} à¤¤à¥ˆà¤¯à¤¾à¤° à¤•à¤° à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦ ({len(generated)}/{count})")
+                await progress_callback(f"Ã¢ÂÂ³ AI question batch {calls} Ã Â¤Â¤Ã Â¥Ë†Ã Â¤Â¯Ã Â¤Â¾Ã Â¤Â° Ã Â¤â€¢Ã Â¤Â° Ã Â¤Â°Ã Â¤Â¹Ã Â¤Â¾ Ã Â¤Â¹Ã Â¥Ë†Ã¢â‚¬Â¦ ({len(generated)}/{count})")
 
             prompt, use_search, source_files_for_call = await make_ai_contents(
                 topic=topic,
@@ -1055,7 +1450,7 @@ async def generate_questions(
                 batch_size = min(8, remaining)
 
             if progress_callback and generated:
-                await progress_callback(f"âœ… {len(generated)}/{count} valid questions à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆà¤‚â€¦")
+                await progress_callback(f"Ã¢Å“â€¦ {len(generated)}/{count} valid questions are readyÃ¢â‚¬Â¦")
 
             if not candidates:
                 break
@@ -1086,7 +1481,7 @@ def admin_only(func):
         if not update.effective_user or not is_admin(update.effective_user.id):
             if update.effective_message:
                 await update.effective_message.reply_text(
-                    "ðŸ“š Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
+                    "Ã°Å¸â€œÅ¡ Quiz creation is available only to the Owner/authorized Admins."
                 )
             return ConversationHandler.END
         return await func(update, context)
@@ -1106,8 +1501,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if not is_admin(user.id):
         await message.reply_text(
-            "ðŸ“š ECA QUIZ MAKER\n\n"
-            "Quiz creation à¤•à¥‡à¤µà¤² Owner/authorized Admins à¤•à¥‡ à¤²à¤¿à¤ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¥¤"
+            "Ã°Å¸â€œÅ¡ ECA QUIZ MAKER\n\n"
+            "Quiz creation is available only to the Owner/authorized Admins."
         )
         return ConversationHandler.END
 
@@ -1117,7 +1512,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         with SessionLocal() as session:
             quiz = session.get(Quiz, quiz_id)
         if not quiz:
-            await message.reply_text("âŒ à¤¯à¤¹ quiz link valid à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆ à¤¯à¤¾ quiz à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+            await message.reply_text("Ã¢ÂÅ’ This quiz link is invalid or the prepared quiz is no longer available.")
             return ConversationHandler.END
 
         context.user_data["prepared_quiz_id"] = quiz_id
@@ -1130,23 +1525,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             context.user_data["run_mode"] = "group"
             context.user_data["target_chat_id"] = message.chat.id
             await message.reply_text(
-                "ðŸŽ¯ QUIZ READY\n\n"
-                f"ðŸ“š Topic: {quiz.title}\n"
-                f"ðŸ”¢ Questions: {quiz.question_count}\n"
-                f"ðŸŒ Language: {quiz.language}\n\n"
-                "â±ï¸ à¤¹à¤° question à¤•à¤¾ à¤¸à¤®à¤¯ à¤šà¥à¤¨à¥‡à¤‚:",
+                "Ã°Å¸Å½Â¯ QUIZ READY\n\n"
+                f"Ã°Å¸â€œÅ¡ Topic: {quiz.title}\n"
+                f"Ã°Å¸â€Â¢ Questions: {quiz.question_count}\n"
+                f"Ã°Å¸Å’Â Language: {quiz.language}\n\n"
+                "Ã¢ÂÂ±Ã¯Â¸Â Choose the time allowed for each question:",
                 reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
             )
             return STATE_GROUP_START_TIME
 
         await message.reply_text(
-            "ðŸŽ¯ QUIZ READY\n\n"
-            f"ðŸ“š Topic: {quiz.title}\n"
-            f"ðŸ”¢ Questions: {quiz.question_count}\n"
-            f"ðŸŒ Language: {quiz.language}\n\n"
-            "Quiz à¤…à¤­à¥€ publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥à¤† à¤¹à¥ˆà¥¤ à¤ªà¤¹à¤²à¥‡ à¤¬à¤¤à¤¾à¤‡à¤ à¤‡à¤¸à¥‡ à¤•à¤¹à¤¾à¤ à¤šà¤²à¤¾à¤¨à¤¾ à¤¹à¥ˆ:",
+            "Ã°Å¸Å½Â¯ QUIZ READY\n\n"
+            f"Ã°Å¸â€œÅ¡ Topic: {quiz.title}\n"
+            f"Ã°Å¸â€Â¢ Questions: {quiz.question_count}\n"
+            f"Ã°Å¸Å’Â Language: {quiz.language}\n\n"
+            "The quiz is prepared but not published yet. Choose where to start it:",
             reply_markup=ReplyKeyboardMarkup(
-                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
+                [["Ã°Å¸â€˜Â¤ Personally", "Ã°Å¸â€˜Â¥ Group"]],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             ),
@@ -1154,9 +1549,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return STATE_START_LOCATION
 
     await message.reply_text(
-        "ðŸ“š ETERNAL CIVIL ACADEMY\n"
+        "Ã°Å¸â€œÅ¡ ETERNAL CIVIL ACADEMY\n"
         "QUIZ MAKER\n\n"
-        "à¤†à¤ª à¤•à¥à¤¯à¤¾ à¤•à¤°à¤¨à¤¾ à¤šà¤¾à¤¹à¤¤à¥‡ à¤¹à¥ˆà¤‚?",
+        "What would you like to do?",
         reply_markup=ReplyKeyboardMarkup(
             MAIN_BUTTONS,
             resize_keyboard=True,
@@ -1171,18 +1566,18 @@ async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     choice = update.effective_message.text.strip()
 
-    if choice == "ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡":
+    if choice == "Ã°Å¸Â¤â€“ AI Generate Questions":
         context.user_data["mode"] = "ai"
         await update.effective_message.reply_text(
-            "Topic à¤­à¥‡à¤œà¤¿à¤à¥¤\n\n"
-            "AI à¤¸à¥à¤µà¤¯à¤‚ authoritative sources à¤–à¥‹à¤œà¥‡à¤—à¤¾, facts verify à¤•à¤°à¥‡à¤—à¤¾ à¤”à¤° original questions à¤¬à¤¨à¤¾à¤à¤—à¤¾à¥¤"
+            "Enter the topic.\n\n"
+            "The AI will find authoritative sources, verify facts, and create original questions."
         )
         return STATE_TOPIC
 
-    if choice == "ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾":
+    if choice == "Ã°Å¸â€œÅ¡ I Will Provide Source":
         context.user_data["mode"] = "source"
         await update.effective_message.reply_text(
-            "Source à¤•à¤¾ à¤ªà¥à¤°à¤•à¤¾à¤° à¤šà¥à¤¨à¥‡à¤‚:",
+            "Choose the source type:",
             reply_markup=ReplyKeyboardMarkup(
                 SOURCE_TYPE_BUTTONS,
                 resize_keyboard=True,
@@ -1191,7 +1586,7 @@ async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         return STATE_SOURCE_TYPE
 
-    await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ à¤¦à¤¿à¤ à¤—à¤ options à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+    await update.effective_message.reply_text("Please choose one of the available options.")
     return STATE_MODE
 
 
@@ -1200,36 +1595,36 @@ async def choose_source_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     choice = update.effective_message.text.strip()
     mapping = {
-        "ðŸ“„ PDF": "pdf",
-        "ðŸ–¼ Photo": "photo",
-        "ðŸ“ Text": "text",
-        "ðŸ“Š Telegram Poll": "poll",
-        "ðŸ”— URL": "url",
+        "Ã°Å¸â€œâ€ž PDF": "pdf",
+        "Ã°Å¸â€“Â¼ Photo": "photo",
+        "Ã°Å¸â€œÂ Text": "text",
+        "Ã°Å¸â€œÅ  Telegram Poll": "poll",
+        "Ã°Å¸â€â€” URL": "url",
     }
     source_type = mapping.get(choice)
     if not source_type:
-        await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ source type à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Please choose a source type.")
         return STATE_SOURCE_TYPE
 
     context.user_data["source_type"] = source_type
     if source_type == "text":
-        await update.effective_message.reply_text("à¤…à¤¬ source text à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        await update.effective_message.reply_text("Send the source text now.")
     elif source_type == "url":
-        await update.effective_message.reply_text("à¤…à¤¬ accessible webpage à¤•à¤¾ URL à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        await update.effective_message.reply_text("Send an accessible webpage URL now.")
     elif source_type == "poll":
         await update.effective_message.reply_text(
-            "à¤…à¤¬ Telegram Poll forward/send à¤•à¤°à¥‡à¤‚à¥¤ à¤à¤• à¤¸à¥‡ à¤…à¤§à¤¿à¤• Poll à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚; à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
-            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+            "Forward or send Telegram Polls here. You can send more than one; press Ã¢Å“â€¦ Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     elif source_type == "pdf":
         await update.effective_message.reply_text(
-            "à¤…à¤¬ PDF à¤­à¥‡à¤œà¤¿à¤à¥¤ à¤à¤• à¤¸à¥‡ à¤…à¤§à¤¿à¤• PDF/page files à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚; à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
-            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+            "Send the PDF files here. You can send more than one; press Ã¢Å“â€¦ Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     else:
         await update.effective_message.reply_text(
-            "à¤…à¤¬ clear page/photo à¤­à¥‡à¤œà¤¿à¤à¥¤ à¤à¤• à¤¸à¥‡ à¤…à¤§à¤¿à¤• pages à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚; à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
-            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+            "Send clear page photos here. You can send more than one; press Ã¢Å“â€¦ Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
     return STATE_SOURCE_CONTENT
 
@@ -1242,41 +1637,41 @@ async def receive_source_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     source_type = context.user_data.get("source_type")
 
     if source_type in ("pdf", "photo", "poll"):
-        if text == "âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ":
+        if text == "Ã¢Å“â€¦ Source Ready":
             if source_type in ("pdf", "photo") and not context.user_data.get("source_files"):
-                await update.effective_message.reply_text("âŒ à¤ªà¤¹à¤²à¥‡ à¤•à¤®-à¤¸à¥‡-à¤•à¤® à¤à¤• file à¤­à¥‡à¤œà¤¿à¤à¥¤")
+                await update.effective_message.reply_text("Ã¢ÂÅ’ Send at least one file first.")
                 return STATE_SOURCE_CONTENT
             if source_type == "poll" and not context.user_data.get("source_text"):
-                await update.effective_message.reply_text("âŒ à¤ªà¤¹à¤²à¥‡ à¤•à¤®-à¤¸à¥‡-à¤•à¤® à¤à¤• Telegram Poll à¤­à¥‡à¤œà¤¿à¤à¥¤")
+                await update.effective_message.reply_text("Ã¢ÂÅ’ Send at least one Telegram Poll first.")
                 return STATE_SOURCE_CONTENT
-            await update.effective_message.reply_text("à¤…à¤¬ Topic à¤­à¥‡à¤œà¤¿à¤à¥¤", reply_markup=ReplyKeyboardRemove())
+            await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
             return STATE_TOPIC
-        await update.effective_message.reply_text("Source files/polls à¤­à¥‡à¤œà¤¤à¥‡ à¤°à¤¹à¥‡à¤‚à¥¤ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤")
+        await update.effective_message.reply_text("Keep sending source files/polls. Press Ã¢Å“â€¦ Source Ready when finished.")
         return STATE_SOURCE_CONTENT
 
     if source_type == "url":
         if not re.match(r"^https?://", text, flags=re.I):
-            await update.effective_message.reply_text("âŒ Valid http/https URL à¤­à¥‡à¤œà¤¿à¤à¥¤")
+            await update.effective_message.reply_text("Ã¢ÂÅ’ Send a valid http/https URL.")
             return STATE_SOURCE_CONTENT
-        await update.effective_message.reply_text("â³ URL content à¤ªà¤¢à¤¼à¤¾ à¤œà¤¾ à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦")
+        await update.effective_message.reply_text("Ã¢ÂÂ³ Reading URL contentÃ¢â‚¬Â¦")
         try:
             content = await asyncio.to_thread(fetch_url_text, text)
         except Exception as exc:
             logger.exception("URL fetch failed.")
-            await update.effective_message.reply_text(f"âŒ URL read à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\nà¤•à¤¾à¤°à¤£: {str(exc)[:500]}")
+            await update.effective_message.reply_text(f"Ã¢ÂÅ’ The URL could not be read.\n\nReason: {str(exc)[:500]}")
             return STATE_SOURCE_CONTENT
         context.user_data["source_text"] = content
         context.user_data["source_summary"] = text
-        await update.effective_message.reply_text("à¤…à¤¬ Topic à¤­à¥‡à¤œà¤¿à¤à¥¤", reply_markup=ReplyKeyboardRemove())
+        await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
         return STATE_TOPIC
 
     # plain text source
     if len(text) < 20:
-        await update.effective_message.reply_text("âŒ Source à¤¬à¤¹à¥à¤¤ à¤›à¥‹à¤Ÿà¤¾ à¤¹à¥ˆà¥¤ à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• source material à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ The source is too short. Please provide more source material.")
         return STATE_SOURCE_CONTENT
     context.user_data["source_text"] = text[:MAX_SOURCE_TEXT]
     context.user_data["source_summary"] = "User-supplied text"
-    await update.effective_message.reply_text("à¤…à¤¬ Topic à¤­à¥‡à¤œà¤¿à¤à¥¤", reply_markup=ReplyKeyboardRemove())
+    await update.effective_message.reply_text("Now enter the topic.", reply_markup=ReplyKeyboardRemove())
     return STATE_TOPIC
 
 
@@ -1302,36 +1697,36 @@ async def receive_source_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["source_text"] = joined[:MAX_SOURCE_TEXT]
         context.user_data["source_summary"] = "One or more Telegram Poll sources"
         await update.effective_message.reply_text(
-            "âœ… Poll source received.\n\nà¤”à¤° Poll à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚à¥¤ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
-            reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+            "Ã¢Å“â€¦ Poll source received.\n\nYou can send more Polls. Press Ã¢Å“â€¦ Source Ready when finished.",
+            reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
         )
         return STATE_SOURCE_CONTENT
 
     if source_type == "pdf":
         if not update.effective_message.document or (Path(update.effective_message.document.file_name or "").suffix.lower() != ".pdf"):
-            await update.effective_message.reply_text("âŒ PDF mode à¤®à¥‡à¤‚ à¤•à¥‡à¤µà¤² PDF file à¤­à¥‡à¤œà¤¿à¤à¥¤")
+            await update.effective_message.reply_text("Ã¢ÂÅ’ PDF mode accepts PDF files only.")
             return STATE_SOURCE_CONTENT
     elif source_type == "photo":
         if not update.effective_message.photo:
-            await update.effective_message.reply_text("âŒ Photo mode à¤®à¥‡à¤‚ image à¤­à¥‡à¤œà¤¿à¤à¥¤")
+            await update.effective_message.reply_text("Ã¢ÂÅ’ Photo mode accepts image files only.")
             return STATE_SOURCE_CONTENT
     else:
-        await update.effective_message.reply_text("âŒ à¤¸à¤¹à¥€ source à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Send the correct source type.")
         return STATE_SOURCE_CONTENT
 
     try:
         path, suffix = await download_message_file(update, context)
     except Exception:
         logger.exception("File download failed.")
-        await update.effective_message.reply_text("âŒ File receive à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¥€à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ The file could not be received.")
         return STATE_SOURCE_CONTENT
 
     paths = context.user_data.setdefault("source_files", [])
     paths.append(path)
     context.user_data["source_summary"] = f"{len(paths)} {source_type} source file(s)"
     await update.effective_message.reply_text(
-        f"âœ… File {len(paths)} receive à¤¹à¥‹ à¤—à¤ˆà¥¤\n\nà¤”à¤° pages/files à¤­à¥‡à¤œ à¤¸à¤•à¤¤à¥‡ à¤¹à¥ˆà¤‚à¥¤ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ à¤¦à¤¬à¤¾à¤à¤à¥¤",
-        reply_markup=ReplyKeyboardMarkup([["âœ… Source à¤¤à¥ˆà¤¯à¤¾à¤° à¤¹à¥ˆ"]], resize_keyboard=True, one_time_keyboard=False),
+        f"Ã¢Å“â€¦ Received {len(paths)} source file(s).\n\nYou can send more pages/files. Press Ã¢Å“â€¦ Source Ready when finished.",
+        reply_markup=ReplyKeyboardMarkup([["Ã¢Å“â€¦ Source Ready"]], resize_keyboard=True, one_time_keyboard=False),
     )
     return STATE_SOURCE_CONTENT
 
@@ -1341,10 +1736,10 @@ async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
     topic = update.effective_message.text.strip()
     if len(topic) < 2:
-        await update.effective_message.reply_text("âŒ Valid Topic à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Please enter a valid topic.")
         return STATE_TOPIC
     context.user_data["topic"] = topic
-    await update.effective_message.reply_text("à¤•à¤¿à¤¤à¤¨à¥‡ Questions à¤šà¤¾à¤¹à¤¿à¤?\n\n1 à¤¸à¥‡ 100 à¤•à¥‡ à¤¬à¥€à¤š à¤¸à¤‚à¤–à¥à¤¯à¤¾ à¤­à¥‡à¤œà¤¿à¤à¥¤")
+    await update.effective_message.reply_text("How many questions do you need?\n\nEnter a number from 1 to 100.")
     return STATE_COUNT
 
 
@@ -1354,14 +1749,14 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     try:
         count = int(update.effective_message.text.strip())
     except ValueError:
-        await update.effective_message.reply_text("âŒ à¤•à¥‡à¤µà¤² à¤¸à¤‚à¤–à¥à¤¯à¤¾ à¤­à¥‡à¤œà¤¿à¤à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Enter a number only.")
         return STATE_COUNT
     if not 1 <= count <= MAX_QUESTIONS:
-        await update.effective_message.reply_text(f"âŒ à¤¸à¤‚à¤–à¥à¤¯à¤¾ 1 à¤¸à¥‡ {MAX_QUESTIONS} à¤•à¥‡ à¤¬à¥€à¤š à¤¹à¥‹à¤¨à¥€ à¤šà¤¾à¤¹à¤¿à¤à¥¤")
+        await update.effective_message.reply_text(f"Ã¢ÂÅ’ The number must be between 1 and {MAX_QUESTIONS}.")
         return STATE_COUNT
     context.user_data["question_count"] = count
     await update.effective_message.reply_text(
-        "Language à¤šà¥à¤¨à¥‡à¤‚:",
+        "Choose quiz language:",
         reply_markup=ReplyKeyboardMarkup(LANGUAGE_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
     )
     return STATE_LANGUAGE
@@ -1372,7 +1767,7 @@ async def receive_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
     language = LANGUAGE_LABELS.get(update.effective_message.text.strip())
     if not language:
-        await update.effective_message.reply_text("à¤¹à¤¿à¤‚à¤¦à¥€, English à¤¯à¤¾ à¤¦à¥à¤µà¤¿à¤­à¤¾à¤·à¥€ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Choose Hindi, English, or Bilingual.")
         return STATE_LANGUAGE
     context.user_data["language"] = language
     return await prepare_quiz(update, context)
@@ -1393,9 +1788,9 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     source_files = list(context.user_data.get("source_files", []))
 
     status = await message.reply_text(
-        "â³ Quiz à¤¤à¥ˆà¤¯à¤¾à¤° à¤•à¤¿à¤¯à¤¾ à¤œà¤¾ à¤°à¤¹à¤¾ à¤¹à¥ˆâ€¦\n"
-        "Questions à¤…à¤­à¥€ publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹à¤‚à¤—à¥‡à¥¤\n\n"
-        "AI source verification + originality + duplicate checks à¤šà¤² à¤°à¤¹à¥‡ à¤¹à¥ˆà¤‚â€¦"
+        "Ã¢ÂÂ³ Preparing the quizÃ¢â‚¬Â¦\n"
+        "Questions will not be published yet.\n\n"
+        "Running source verification, originality, and duplicate checksÃ¢â‚¬Â¦"
     )
 
     async def progress(text: str) -> None:
@@ -1418,15 +1813,15 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if not questions:
             if terminal_error and "quota" in terminal_error.lower():
                 await status.edit_text(
-                    "âŒ à¤…à¤­à¥€ AI quota à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤\n\n"
-                    "à¤¸à¤­à¥€ configured Gemini models/keys à¤¨à¥‡ quota/rate-limit error à¤¦à¤¿à¤¯à¤¾à¥¤\n"
-                    "à¤‡à¤¸ bot à¤¨à¥‡ fake/unchecked questions à¤¬à¤¨à¤¾à¤•à¤° à¤†à¤—à¥‡ à¤¨à¤¹à¥€à¤‚ à¤¬à¤¢à¤¼à¤¾à¤¯à¤¾à¥¤"
+                    "Ã¢ÂÅ’ Gemini quota is currently unavailable.\n\n"
+                    "All configured Gemini models/keys returned a quota/rate-limit error.\n"
+                    "The bot did not continue with fake or unchecked questions."
                 )
             else:
                 await status.edit_text(
-                    "âŒ à¤•à¥‹à¤ˆ valid question à¤¤à¥ˆà¤¯à¤¾à¤° à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤\n\n"
-                    "Question quality/verification pass à¤¨à¤¹à¥€à¤‚ à¤¹à¥à¤ˆ, à¤‡à¤¸à¤²à¤¿à¤ quiz publish à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤—à¤¯à¤¾à¥¤\n"
-                    "Topic/source à¤¥à¥‹à¤¡à¤¼à¤¾ à¤…à¤§à¤¿à¤• specific à¤•à¤°à¤•à¥‡ à¤«à¤¿à¤° à¤ªà¥à¤°à¤¯à¤¾à¤¸ à¤•à¤°à¥‡à¤‚à¥¤"
+                    "Ã¢ÂÅ’ No valid question could be prepared.\n\n"
+                    "The quality/verification checks did not pass, so the quiz was not published.\n"
+                    "Please make the topic/source more specific and try again."
                 )
             return ConversationHandler.END
 
@@ -1449,11 +1844,11 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     QuizQuestion(
                         quiz_id=quiz_id,
                         question_no=idx,
-                        question_text=item["question"],
-                        options_json=json.dumps(item["options"], ensure_ascii=False),
+                        question_text=repair_mojibake(item["question"]),
+                        options_json=json.dumps([repair_mojibake(x) for x in item["options"]], ensure_ascii=False),
                         correct_index=int(item["correct_index"]),
-                        explanation=item["explanation"],
-                        source=item["source"],
+                        explanation=repair_mojibake(item["explanation"]),
+                        source=repair_mojibake(item["source"]),
                     )
                 )
             session.commit()
@@ -1472,28 +1867,28 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         partial = ""
         if len(questions) < count:
             partial = (
-                f"\n\nâš ï¸ Requested: {count}\n"
-                f"âœ… Verified/valid: {len(questions)}\n"
-                "à¤•à¤® à¤ªà¥à¤°à¤¶à¥à¤¨ à¤‡à¤¸à¤²à¤¿à¤ à¤°à¤–à¥‡ à¤—à¤ à¤¹à¥ˆà¤‚ à¤•à¥à¤¯à¥‹à¤‚à¤•à¤¿ quality/verification à¤•à¥‹ bypass à¤¨à¤¹à¥€à¤‚ à¤•à¤¿à¤¯à¤¾ à¤—à¤¯à¤¾à¥¤"
+                f"\n\nÃ¢Å¡Â Ã¯Â¸Â Requested: {count}\n"
+                f"Ã¢Å“â€¦ Verified/valid: {len(questions)}\n"
+                "Fewer questions were kept because quality/verification was not bypassed."
             )
             if terminal_error and "quota" in terminal_error.lower():
-                partial += "\n\nGemini quota à¤¨à¥‡ à¤†à¤—à¥‡ generation à¤°à¥‹à¤• à¤¦à¥€à¥¤"
+                partial += "\n\nGemini quota stopped further generation."
 
         await status.edit_text(
-            "âœ… QUIZ READY\n\n"
-            f"ðŸ“š Topic: {topic}\n"
-            f"ðŸ”¢ Questions: {len(questions)}\n"
-            f"ðŸŒ Language: {language}"
+            "Ã¢Å“â€¦ QUIZ READY\n\n"
+            f"Ã°Å¸â€œÅ¡ Topic: {topic}\n"
+            f"Ã°Å¸â€Â¢ Questions: {len(questions)}\n"
+            f"Ã°Å¸Å’Â Language: {language}"
             f"{partial}\n\n"
-            "Questions à¤…à¤­à¥€ à¤à¤• à¤¸à¤¾à¤¥ Telegram à¤ªà¤° à¤¨à¤¹à¥€à¤‚ à¤­à¥‡à¤œà¥‡ à¤—à¤ à¤¹à¥ˆà¤‚à¥¤\n"
-            "à¤ªà¤¹à¤²à¥‡ Start Location à¤”à¤° à¤«à¤¿à¤° à¤ªà¥à¤°à¤¤à¤¿-question time à¤šà¥à¤¨à¤¨à¤¾ à¤¹à¥‹à¤—à¤¾à¥¤\n\n"
-            f"ðŸ”— Prepared Quiz Link:\n{personal_link}"
+            "Questions have not been published as a batch.\n"
+            "Choose the start location first, then the time per question.\n\n"
+            f"Ã°Å¸â€â€” Prepared Quiz Link:\n{personal_link}"
         )
 
         await message.reply_text(
-            "ðŸ“ Quiz à¤•à¤¹à¤¾à¤ à¤¶à¥à¤°à¥‚ à¤•à¤°à¤¨à¤¾ à¤¹à¥ˆ?",
+            "Ã°Å¸â€œÂ Where should the quiz start?",
             reply_markup=ReplyKeyboardMarkup(
-                [["ðŸ‘¤ Personally", "ðŸ‘¥ Group"]],
+                [["Ã°Å¸â€˜Â¤ Personally", "Ã°Å¸â€˜Â¥ Group"]],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             ),
@@ -1501,7 +1896,7 @@ async def prepare_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return STATE_START_LOCATION
     except Exception:
         logger.exception("Quiz preparation failed.")
-        await status.edit_text("âŒ Quiz preparation à¤®à¥‡à¤‚ unexpected error à¤†à¤¯à¤¾à¥¤ Logs à¤®à¥‡à¤‚ technical details à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¹à¥ˆà¤‚à¥¤")
+        await status.edit_text("Ã¢ÂÅ’ An unexpected error occurred while preparing the quiz. Check the Render logs for technical details.")
         return ConversationHandler.END
     finally:
         # generate_questions() itself cleans the source file.
@@ -1519,29 +1914,29 @@ async def choose_start_location(update: Update, context: ContextTypes.DEFAULT_TY
     choice = update.effective_message.text.strip()
     quiz_id = context.user_data.get("prepared_quiz_id")
     if not quiz_id:
-        await update.effective_message.reply_text("âŒ Prepared quiz à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Prepared quiz not found. Start again with /start.")
         return ConversationHandler.END
 
-    if choice == "ðŸ‘¤ Personally":
+    if choice == "Ã°Å¸â€˜Â¤ Personally":
         if update.effective_chat.type != "private":
-            await update.effective_message.reply_text("âŒ Personal mode à¤•à¥‡à¤µà¤² bot à¤•à¥€ private chat à¤®à¥‡à¤‚ à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‡à¤‚à¥¤")
+            await update.effective_message.reply_text("Ã¢ÂÅ’ Personal mode must be started in the bot's private chat.")
             return STATE_START_LOCATION
         context.user_data["run_mode"] = "personal"
         context.user_data["target_chat_id"] = update.effective_chat.id
 
         await update.effective_message.reply_text(
-            "â±ï¸ à¤à¤• question à¤•à¤¿à¤¤à¤¨à¥‡ à¤¸à¤®à¤¯ à¤¤à¤• à¤šà¤²à¥‡?\n\n"
-            "à¤¸à¤®à¤¯ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¤à¥‡ à¤¹à¥€ à¤…à¤—à¤²à¤¾ question à¤…à¤ªà¤¨à¥‡-à¤†à¤ª à¤†à¤à¤—à¤¾à¥¤",
+            "Ã¢ÂÂ±Ã¯Â¸Â Choose the time allowed for each question.\n\n"
+            "The next question will start automatically when the time ends.",
             reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
         )
         return STATE_TIME
 
-    if choice == "ðŸ‘¥ Group":
+    if choice == "Ã°Å¸â€˜Â¥ Group":
         if update.effective_chat.type in ("group", "supergroup"):
             context.user_data["run_mode"] = "group"
             context.user_data["target_chat_id"] = update.effective_chat.id
             await update.effective_message.reply_text(
-                "â±ï¸ à¤à¤• question à¤•à¤¿à¤¤à¤¨à¥‡ à¤¸à¤®à¤¯ à¤¤à¤• à¤šà¤²à¥‡?",
+                "Ã¢ÂÂ±Ã¯Â¸Â Choose the time allowed for each question.",
                 reply_markup=ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True, one_time_keyboard=True),
             )
             return STATE_TIME
@@ -1549,15 +1944,15 @@ async def choose_start_location(update: Update, context: ContextTypes.DEFAULT_TY
         bot = await context.bot.get_me()
         group_link = f"https://t.me/{bot.username}?startgroup=quiz_{quiz_id}"
         await update.effective_message.reply_text(
-            "ðŸ‘¥ Group mode selected.\n\n"
-            "à¤œà¤¿à¤¸ group à¤®à¥‡à¤‚ quiz à¤šà¤²à¤¾à¤¨à¤¾ à¤¹à¥ˆ, à¤µà¤¹à¤¾à¤ bot à¤•à¥‹ add à¤•à¤°à¥‡à¤‚ à¤”à¤° à¤¨à¥€à¤šà¥‡ à¤µà¤¾à¤²à¤¾ link à¤‡à¤¸à¥à¤¤à¥‡à¤®à¤¾à¤² à¤•à¤°à¥‡à¤‚à¥¤\n\n"
-            f"ðŸ”— Group Start Link:\n{group_link}\n\n"
-            "Group à¤®à¥‡à¤‚ quiz à¤¶à¥à¤°à¥‚ à¤¹à¥‹à¤¨à¥‡ à¤ªà¤° à¤µà¤¹à¥€à¤‚ timer à¤ªà¥‚à¤›à¤¾ à¤œà¤¾à¤à¤—à¤¾à¥¤",
+            "Ã°Å¸â€˜Â¥ Group mode selected.\n\n"
+            "Add the bot to the group where you want to run the quiz and use the link below.\n\n"
+            f"Ã°Å¸â€â€” Group Start Link:\n{group_link}\n\n"
+            "When the quiz starts in the group, the timer will be selected there.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
 
-    await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ Personally à¤¯à¤¾ Group à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+    await update.effective_message.reply_text("Please choose Personally or Group.")
     return STATE_START_LOCATION
 
 
@@ -1567,7 +1962,7 @@ async def choose_question_time(update: Update, context: ContextTypes.DEFAULT_TYP
 
     seconds = TIME_OPTIONS.get(update.effective_message.text.strip())
     if not seconds:
-        await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ 15, 25, 30 à¤¸à¥‡à¤•à¤‚à¤¡ à¤¯à¤¾ 1 à¤®à¤¿à¤¨à¤Ÿ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Choose 15 seconds, 25 seconds, 30 seconds, or 1 minute.")
         return STATE_TIME
 
     return await start_run_after_timer(update, context, seconds)
@@ -1578,7 +1973,7 @@ async def choose_group_start_time(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     seconds = TIME_OPTIONS.get(update.effective_message.text.strip())
     if not seconds:
-        await update.effective_message.reply_text("à¤•à¥ƒà¤ªà¤¯à¤¾ 15, 25, 30 à¤¸à¥‡à¤•à¤‚à¤¡ à¤¯à¤¾ 1 à¤®à¤¿à¤¨à¤Ÿ à¤®à¥‡à¤‚ à¤¸à¥‡ à¤šà¥à¤¨à¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Choose 15 seconds, 25 seconds, 30 seconds, or 1 minute.")
         return STATE_GROUP_START_TIME
     return await start_run_after_timer(update, context, seconds)
 
@@ -1589,7 +1984,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
     target_chat_id = context.user_data.get("target_chat_id")
 
     if not quiz_id or mode not in ("personal", "group") or not target_chat_id:
-        await update.effective_message.reply_text("âŒ Quiz run details à¤…à¤§à¥‚à¤°à¥‡ à¤¹à¥ˆà¤‚à¥¤ /start à¤¸à¥‡ à¤«à¤¿à¤° à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ Quiz run details are incomplete. Start again with /start.")
         return ConversationHandler.END
 
     # Make sure quiz still exists and has questions.
@@ -1597,7 +1992,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         quiz = session.get(Quiz, quiz_id)
         q_count = session.scalar(select(QuizQuestion.id).where(QuizQuestion.quiz_id == quiz_id).limit(1))
     if not quiz or q_count is None:
-        await update.effective_message.reply_text("âŒ à¤¯à¤¹ prepared quiz à¤…à¤¬ à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ This prepared quiz is no longer available.")
         return ConversationHandler.END
 
     run_id = f"{quiz_id}-run-{uuid.uuid4().hex[:18]}"
@@ -1619,10 +2014,10 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         session.commit()
 
     await update.effective_message.reply_text(
-        "ðŸš€ QUIZ STARTING\n\n"
-        f"â±ï¸ à¤ªà¥à¤°à¤¤à¥à¤¯à¥‡à¤• question: {seconds} seconds\n"
-        "âž¡ï¸ à¤¸à¤®à¤¯ à¤ªà¥‚à¤°à¤¾ à¤¹à¥‹à¤¤à¥‡ à¤¹à¥€ à¤…à¤—à¤²à¤¾ question à¤…à¤ªà¤¨à¥‡-à¤†à¤ª à¤†à¤à¤—à¤¾à¥¤\n"
-        "âŒ à¤¸à¤­à¥€ questions à¤à¤• à¤¸à¤¾à¤¥ à¤¨à¤¹à¥€à¤‚ à¤­à¥‡à¤œà¥‡ à¤œà¤¾à¤à¤‚à¤—à¥‡à¥¤",
+        "Ã°Å¸Å¡â‚¬ QUIZ STARTING\n\n"
+        f"Ã¢ÂÂ±Ã¯Â¸Â Time per question: {seconds} seconds\n"
+        "Ã¢Å¾Â¡Ã¯Â¸Â The next question starts automatically when time expires.\n"
+        "Ã¢ÂÅ’ Questions will not be sent all at once.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -1631,7 +2026,7 @@ async def start_run_after_timer(update: Update, context: ContextTypes.DEFAULT_TY
         await send_next_question(context, run_id)
     except Exception:
         logger.exception("Initial quiz question failed for run=%s", run_id)
-        await update.effective_message.reply_text("âŒ Quiz start à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾à¥¤")
+        await update.effective_message.reply_text("Ã¢ÂÅ’ The quiz could not be started.")
     return ConversationHandler.END
 
 
@@ -1667,10 +2062,11 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             await safe_send_message(
                 context.bot,
                 target_chat_id,
-                "ðŸ QUIZ COMPLETED\n\n"
-                "à¤¸à¤­à¥€ questions à¤ªà¥‚à¤°à¥‡ à¤¹à¥‹ à¤—à¤à¥¤\n\n"
+                "Ã°Å¸ÂÂ QUIZ COMPLETED\n\n"
+                "All questions have been completed.\n\n"
                 f"{completed_text}",
             )
+            await send_answer_explanation_pdf(context, run_id, target_chat_id)
             return
 
         options = json.loads(question.options_json)
@@ -1680,7 +2076,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             await safe_send_message(
                 context.bot,
                 run.target_chat_id,
-                f"âŒ Question {next_no} publish à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤¸à¤•à¤¾ à¤•à¥à¤¯à¥‹à¤‚à¤•à¤¿ stored options invalid à¤¹à¥ˆà¤‚à¥¤",
+                f"Ã¢ÂÅ’ Question {next_no} could not be published because its stored options are invalid.",
             )
             return
 
@@ -1689,9 +2085,9 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
         target = run.target_chat_id
         interval = run.interval_seconds
         correct_index = question.correct_index
-        explanation = question.explanation
-        question_text = question.question_text
-        topic = quiz.title
+        explanation = repair_mojibake(question.explanation)
+        question_text = repair_mojibake(question.question_text)
+        topic = repair_mojibake(quiz.title)
 
     try:
         message = await context.bot.send_poll(
@@ -1705,7 +2101,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             correct_option_id=correct_index,
             explanation=explanation[:200],
             description=(
-                f"ðŸ“š ECA QUIZ | {topic}\n"
+                f"Ã°Å¸â€œÅ¡ ECA QUIZ | {topic}\n"
                 f"Question {next_no}\n\n"
                 f"{SOURCE_FOOTER}"
             )[:1024],
@@ -1727,7 +2123,7 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
             correct_option_id=correct_index,
             explanation=explanation[:200],
             description=(
-                f"ðŸ“š ECA QUIZ | {topic}\n"
+                f"Ã°Å¸â€œÅ¡ ECA QUIZ | {topic}\n"
                 f"Question {next_no}\n\n"
                 f"{SOURCE_FOOTER}"
             )[:1024],
@@ -1743,8 +2139,8 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE, run_id: str) ->
         await safe_send_message(
             context.bot,
             target,
-            "âŒ Telegram à¤¨à¥‡ quiz poll publish à¤•à¤°à¤¨à¥‡ à¤¸à¥‡ à¤®à¤¨à¤¾ à¤•à¤° à¤¦à¤¿à¤¯à¤¾à¥¤\n\n"
-            "Group à¤®à¥‡à¤‚ bot à¤•à¥‹ à¤¸à¤¹à¥€ permissions à¤¦à¥‡à¤‚, à¤¯à¤¾ Personal mode à¤®à¥‡à¤‚ à¤•à¥‹à¤¶à¤¿à¤¶ à¤•à¤°à¥‡à¤‚à¥¤",
+            "Ã¢ÂÅ’ Telegram rejected the quiz poll.\n\n"
+            "Give the bot the required group permissions, or try Personal mode.",
         )
         return
 
@@ -1837,13 +2233,25 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def build_leaderboard(run_id: str) -> str:
+    """Build the final leaderboard for a completed quiz run.
+
+    Participant rule:
+      - Only students who attempted at least one question are listed.
+      - If more than 50 students attempted, only the first 50 sorted by correct
+        answers are shown.
+
+    Ranking rule requested by ECA:
+      - Rank is based on number of correct answers.
+      - Students with the same number of correct answers receive the same rank.
+      - Raw marks are displayed separately as Correct - Wrong/3.
+    """
     with SessionLocal() as session:
         run = session.get(QuizRun, run_id)
         if not run:
-            return "Quiz run à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤"
+            return "Quiz run not found."
         quiz = session.get(Quiz, run.quiz_id)
         if not quiz:
-            return "Quiz à¤¨à¤¹à¥€à¤‚ à¤®à¤¿à¤²à¤¾à¥¤"
+            return "Quiz not found."
 
         answers = session.scalars(
             select(PollAnswer).where(PollAnswer.run_id == run_id)
@@ -1862,52 +2270,66 @@ def build_leaderboard(run_id: str) -> str:
             item["wrong"] += 1
 
     rows: list[dict[str, Any]] = []
+    total_questions = int(quiz.question_count)
     for user_id, item in participant_map.items():
         correct = int(item["correct"])
         wrong = int(item["wrong"])
-        raw_marks = correct - (wrong / 3)
+        answered = correct + wrong
+        unattempted = max(0, total_questions - answered)
+        raw_marks = correct - (wrong / 3.0)
         rows.append(
             {
                 "user_id": user_id,
-                "name": str(item["name"]),
+                "name": repair_mojibake(item["name"]),
                 "correct": correct,
                 "wrong": wrong,
+                "unattempted": unattempted,
                 "raw_marks": raw_marks,
             }
         )
 
-    rows.sort(key=lambda x: x["raw_marks"], reverse=True)
-    previous = None
+    # Primary order is correct answers; raw marks is a deterministic tie-breaker
+    # within the same correct-answer count, but rank remains identical.
+    rows.sort(
+        key=lambda x: (-x["correct"], -x["raw_marks"], x["name"].lower(), x["user_id"])
+    )
+
+    previous_correct: Optional[int] = None
     rank = 0
-    for index, row in enumerate(rows, 1):
-        marks = row["raw_marks"]
-        # Compare rounded marks to avoid binary floating point artifacts.
-        marks_key = round(marks, 8)
-        if previous is None or marks_key != previous:
+    for index, row in enumerate(rows, start=1):
+        correct_key = int(row["correct"])
+        if previous_correct is None or correct_key != previous_correct:
             rank = index
         row["rank"] = rank
-        previous = marks_key
+        previous_correct = correct_key
 
     lines = [
-        "ðŸ† ECA LIVE QUIZ â€” TOP 50",
+        "Ã°Å¸Ââ€  ECA LIVE QUIZ Ã¢â‚¬â€ LEADERBOARD",
         "",
-        f"Quiz: {quiz.title}",
+        f"Quiz: {repair_mojibake(quiz.title)}",
         "",
     ]
+
     if not rows:
-        lines.append("à¤•à¥‹à¤ˆ participant result à¤‰à¤ªà¤²à¤¬à¥à¤§ à¤¨à¤¹à¥€à¤‚ à¤¹à¥ˆà¥¤")
+        lines.append("No student attempted any question.")
         return "\n".join(lines)
 
     for row in rows[:50]:
+        # Requested compact format: Ã¢Å“â€¦right Ã¢ÂÅ’wrong Ã¢Â­â€¢unattempted [Raw marksÃ¢â‚¬â€X] rank
+        raw = row["raw_marks"]
+        raw_text = f"{raw:.2f}".rstrip("0").rstrip(".")
         lines.append(
-            f"{row['rank']}. {row['name'][:45]} â€” "
-            f"âœ…{row['correct']} âŒ{row['wrong']} | RM {row['raw_marks']:.2f}"
+            f"{row['name'][:45]} ({row['user_id']}) Ã¢â‚¬â€ "
+            f"Ã¢Å“â€¦{row['correct']} Ã¢ÂÅ’{row['wrong']} Ã¢Â­â€¢{row['unattempted']} "
+            f"[Raw marksÃ¢â‚¬â€{raw_text}] {row['rank']}"
         )
+
     return "\n".join(lines)
 
 
 async def safe_send_message(bot: Any, chat_id: int, text: str) -> None:
     try:
+        text = repair_mojibake(text)
         await bot.send_message(chat_id=chat_id, text=text[:4096])
     except Exception:
         logger.exception("Could not send message to chat=%s", chat_id)
@@ -1965,7 +2387,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cleanup_file(context.user_data.get("source_file"))
     context.user_data.clear()
     await update.effective_message.reply_text(
-        "âŒ Operation cancelled.",
+        "Ã¢ÂÅ’ Operation cancelled.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
@@ -1973,17 +2395,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "ðŸ“š ECA QUIZ MAKER\n\n"
-        "/start â€” Quiz Maker\n"
-        "/cancel â€” Current operation cancel\n"
-        "/whoami â€” Telegram User ID\n\n"
-        "OWNER:\n"
-        "/addadmin â€” user message à¤ªà¤° reply à¤•à¤°à¤•à¥‡\n"
-        "/removeadmin â€” admin message à¤ªà¤° reply à¤•à¤°à¤•à¥‡\n"
-        "/admins â€” Admin list\n\n"
-        "Main Modes:\n"
-        "ðŸ¤– AI à¤–à¥à¤¦ Questions Generate à¤•à¤°à¥‡\n"
-        "ðŸ“š à¤®à¥ˆà¤‚ à¤–à¥à¤¦ Source à¤¦à¥‚à¤à¤—à¤¾"
+        "Ã°Å¸â€œÅ¡ ECA QUIZ MAKER\n\n"
+        "/start Ã¢â‚¬â€ Quiz Maker\n"
+        "/cancel Ã¢â‚¬â€ Cancel current operation\n"
+        "/whoami Ã¢â‚¬â€ Show Telegram User ID\n\n"
+        "OWNER COMMANDS\n"
+        "/addadmin Ã¢â‚¬â€ reply to a user message\n"
+        "/removeadmin Ã¢â‚¬â€ reply to an admin message\n"
+        "/admins Ã¢â‚¬â€ Show admin list\n\n"
+        "MAIN MODES\n"
+        "Ã°Å¸Â¤â€“ AI Generate Questions\n"
+        "Ã°Å¸â€œÅ¡ I Will Provide Source"
     )
 
 
